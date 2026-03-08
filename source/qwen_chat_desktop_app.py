@@ -600,6 +600,7 @@ def resolve_local_base_model_path(value: str) -> str:
     raw = str(value or "").strip()
     override_raw = str(os.environ.get(BASE_MODEL_OVERRIDE_ENV) or "").strip()
     repo_id = raw if looks_like_model_repo_id(raw) else DEFAULT_BASE_MODEL_REPO
+    bundled_base_model = find_bundled_base_model_dir()
 
     if override_raw:
         override_path = Path(override_raw).expanduser()
@@ -617,6 +618,8 @@ def resolve_local_base_model_path(value: str) -> str:
                 raise FileNotFoundError(f"Base model directory exists but does not look usable for offline loading: {raw_path}")
             return str(safe_resolve(raw_path))
         if looks_like_model_repo_id(raw):
+            if raw == DEFAULT_BASE_MODEL_REPO and bundled_base_model is not None:
+                return str(bundled_base_model)
             resolved_snapshot = find_cached_model_snapshot(raw)
             if resolved_snapshot is not None:
                 return str(resolved_snapshot)
@@ -628,6 +631,9 @@ def resolve_local_base_model_path(value: str) -> str:
                 f"Set {BASE_MODEL_OVERRIDE_ENV} to a local model directory or pre-download the base model."
             )
         raise FileNotFoundError(f"Base model path does not exist: {raw_path}")
+
+    if bundled_base_model is not None:
+        return str(bundled_base_model)
 
     default_snapshot = Path(DEFAULT_BASE_MODEL)
     if safe_exists(default_snapshot) and is_local_model_dir(default_snapshot):
@@ -694,6 +700,17 @@ def find_bundled_adapter_dir() -> Optional[Path]:
     candidate = Path(meipass) / "bundled_latest_adapter"
     if (candidate / "adapter_config.json").exists():
         return candidate.resolve()
+    return None
+
+
+def find_bundled_base_model_dir() -> Optional[Path]:
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return None
+    for folder_name in ("bundled_base_model", "base_model"):
+        candidate = Path(meipass) / folder_name
+        if is_local_model_dir(candidate):
+            return safe_resolve(candidate)
     return None
 
 

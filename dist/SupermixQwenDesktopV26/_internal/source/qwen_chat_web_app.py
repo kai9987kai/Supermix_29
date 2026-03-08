@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -18,6 +19,15 @@ from transformers import Qwen2ForCausalLM, Qwen2Tokenizer
 DEFAULT_BASE_MODEL = (
     r"C:\Users\kai99\.cache\huggingface\hub\models--Qwen--Qwen2.5-0.5B-Instruct"
     r"\snapshots\7ae557604adf67be50417f59c2c2f167def9a775"
+)
+DEFAULT_BASE_MODEL_REPO = "Qwen/Qwen2.5-0.5B-Instruct"
+BASE_MODEL_OVERRIDE_ENV = "SUPERMIX_QWEN_BASE_MODEL_DIR"
+MODEL_REPO_ID_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+$")
+MODEL_WEIGHT_FILES = (
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
 )
 DEFAULT_SYSTEM_PROMPT = (
     "You are Supermix Qwen v26, a practical local assistant. "
@@ -821,13 +831,143 @@ def resolve_adapter_dir(project_root: Path, explicit_adapter_dir: str) -> Path:
     return find_latest_adapter_dir(project_root)
 
 
+def looks_like_model_repo_id(value: str) -> bool:
+    return bool(MODEL_REPO_ID_RE.fullmatch(str(value or "").strip()))
+
+
+def is_local_model_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "config.json").exists() and any((path / name).exists() for name in MODEL_WEIGHT_FILES)
+
+
+def iter_hf_cache_roots() -> List[Path]:
+    roots: List[Path] = []
+    seen: set[str] = set()
+
+    def add_path(path: Optional[Path]) -> None:
+        if path is None:
+            return
+        candidate = path.expanduser()
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            roots.append(resolved)
+
+    for env_name in ("HF_HUB_CACHE", "TRANSFORMERS_CACHE"):
+        raw = str(os.environ.get(env_name) or "").strip()
+        if raw:
+            add_path(Path(raw))
+    hf_home = str(os.environ.get("HF_HOME") or "").strip()
+    if hf_home:
+        add_path(Path(hf_home) / "hub")
+    xdg_cache = str(os.environ.get("XDG_CACHE_HOME") or "").strip()
+    if xdg_cache:
+        add_path(Path(xdg_cache) / "huggingface" / "hub")
+    add_path(Path.home() / ".cache" / "huggingface" / "hub")
+    local_appdata = str(os.environ.get("LOCALAPPDATA") or "").strip()
+    if local_appdata:
+        add_path(Path(local_appdata) / "huggingface" / "hub")
+    return roots
+
+
+def find_cached_model_snapshot(repo_id: str, extra_roots: Optional[List[Path]] = None) -> Optional[Path]:
+    folder_name = f"models--{repo_id.replace('/', '--')}"
+    roots = list(extra_roots or []) + iter_hf_cache_roots()
+    seen: set[str] = set()
+
+    def iter_snapshot_candidates(repo_cache_dir: Path) -> List[Path]:
+        candidates: List[Path] = []
+        refs_dir = repo_cache_dir / "refs"
+        for ref_name in ("main", "master"):
+            ref_file = refs_dir / ref_name
+            if ref_file.exists():
+                snapshot_name = ref_file.read_text(encoding="utf-8", errors="ignore").strip()
+                if snapshot_name:
+                    candidates.append(repo_cache_dir / "snapshots" / snapshot_name)
+        snapshots_dir = repo_cache_dir / "snapshots"
+        if snapshots_dir.exists():
+            candidates.extend(
+                sorted(
+                    (child for child in snapshots_dir.iterdir() if child.is_dir()),
+                    key=lambda child: child.stat().st_mtime,
+                    reverse=True,
+                )
+            )
+        return candidates
+
+    for root in roots:
+        for repo_cache_dir in (root, root / folder_name):
+            key = str(repo_cache_dir)
+            if key in seen:
+                continue
+            seen.add(key)
+            if is_local_model_dir(repo_cache_dir):
+                return repo_cache_dir.resolve()
+            if not repo_cache_dir.exists():
+                continue
+            for snapshot_dir in iter_snapshot_candidates(repo_cache_dir):
+                if is_local_model_dir(snapshot_dir):
+                    return snapshot_dir.resolve()
+    return None
+
+
+def resolve_local_base_model_path(value: str) -> str:
+    raw = str(value or "").strip()
+    override_raw = str(os.environ.get(BASE_MODEL_OVERRIDE_ENV) or "").strip()
+    repo_id = raw if looks_like_model_repo_id(raw) else DEFAULT_BASE_MODEL_REPO
+
+    if override_raw:
+        override_path = Path(override_raw).expanduser()
+        resolved_override = find_cached_model_snapshot(repo_id, extra_roots=[override_path])
+        if resolved_override is not None:
+            return str(resolved_override)
+        raise FileNotFoundError(
+            f"{BASE_MODEL_OVERRIDE_ENV} is set to '{override_path}', but no usable local base model was found there for '{repo_id}'."
+        )
+
+    if raw:
+        raw_path = Path(raw).expanduser()
+        if raw_path.exists():
+            if not is_local_model_dir(raw_path):
+                raise FileNotFoundError(f"Base model directory exists but does not look usable for offline loading: {raw_path}")
+            return str(raw_path.resolve())
+        if looks_like_model_repo_id(raw):
+            resolved_snapshot = find_cached_model_snapshot(raw)
+            if resolved_snapshot is not None:
+                return str(resolved_snapshot)
+            default_snapshot = Path(DEFAULT_BASE_MODEL)
+            if raw == DEFAULT_BASE_MODEL_REPO and default_snapshot.exists() and is_local_model_dir(default_snapshot):
+                return str(default_snapshot.resolve())
+            raise FileNotFoundError(
+                f"Could not find a local Hugging Face cache snapshot for '{raw}'. "
+                f"Set {BASE_MODEL_OVERRIDE_ENV} to a local model directory or pre-download the base model."
+            )
+        raise FileNotFoundError(f"Base model path does not exist: {raw_path}")
+
+    default_snapshot = Path(DEFAULT_BASE_MODEL)
+    if default_snapshot.exists() and is_local_model_dir(default_snapshot):
+        return str(default_snapshot.resolve())
+
+    resolved_snapshot = find_cached_model_snapshot(DEFAULT_BASE_MODEL_REPO)
+    if resolved_snapshot is not None:
+        return str(resolved_snapshot)
+
+    raise FileNotFoundError(
+        f"Could not resolve a local base model for '{DEFAULT_BASE_MODEL_REPO}'. "
+        f"Set {BASE_MODEL_OVERRIDE_ENV} to a local model directory or pre-download the base model."
+    )
+
+
 def resolve_base_model_path(explicit_base_model: str, adapter_dir: Path) -> str:
     raw = str(explicit_base_model or "").strip()
     if raw:
-        return raw
+        return resolve_local_base_model_path(raw)
     adapter_cfg = load_json_if_exists(adapter_dir / "adapter_config.json") or {}
     base_model = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
-    return base_model or DEFAULT_BASE_MODEL
+    return resolve_local_base_model_path(base_model)
 
 
 class Engine:
@@ -1015,6 +1155,7 @@ def resolve_device(preferred: str) -> torch.device:
 
 
 def load_engine(base_model: str, adapter_dir: Path, device: torch.device) -> Engine:
+    base_model = resolve_local_base_model_path(base_model)
     profile = build_artifact_profile(adapter_dir)
     logging.info("Loading tokenizer from %s", base_model)
     tokenizer = Qwen2Tokenizer.from_pretrained(base_model, local_files_only=True)

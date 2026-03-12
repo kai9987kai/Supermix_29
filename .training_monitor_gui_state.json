@@ -8,6 +8,7 @@
   "search": "",
   "auto_refresh": true,
   "trend_metric": "rate",
-  "sort_col": "status",
+  "trend_window": "60m",
+  "sort_col": "run",
   "sort_reverse": false
 }

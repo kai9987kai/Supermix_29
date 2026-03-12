@@ -51,7 +51,7 @@ PRESET_GENERATION = {
 }
 VALID_PRESETS = tuple(PRESET_GENERATION.keys())
 
-HTML = """<!doctype html>
+HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -59,8 +59,8 @@ HTML = """<!doctype html>
   <title>Supermix Qwen v26</title>
   <style>
     :root{
-      --bg:#08121e;--panel:rgba(12,24,38,.9);--panel-2:rgba(16,30,46,.96);--line:rgba(151,180,214,.18);
-      --text:#ecf3fb;--muted:#9db2cc;--blue:#68b4ff;--amber:#ffb163;--up:#8dd8a8;--down:#f2b3b3;
+      --bg:#08121e;--panel:rgba(12,24,38,.9);--panel-2:rgba(16,30,46,.96);--panel-3:rgba(9,18,29,.92);--line:rgba(151,180,214,.18);
+      --text:#ecf3fb;--muted:#9db2cc;--blue:#68b4ff;--amber:#ffb163;--up:#8dd8a8;--down:#f2b3b3;--rose:#ff8f8f;
       --r-xl:26px;--r-lg:18px;--r-md:14px;--r-sm:10px;--shadow:0 32px 80px rgba(0,0,0,.35);
     }
     *{box-sizing:border-box} html,body{height:100%}
@@ -89,6 +89,7 @@ HTML = """<!doctype html>
       display:inline-flex;align-items:center;gap:8px;padding:9px 12px;border-radius:999px;border:1px solid var(--line);
       background:rgba(255,255,255,.04);color:var(--text);cursor:pointer;transition:transform .14s ease,border-color .18s ease,background .18s ease
     }
+    .pill{font-size:12px}
     .preset-btn.active{border-color:rgba(104,180,255,.48);background:rgba(104,180,255,.12)}
     .primary-btn{background:linear-gradient(135deg,#2d74c4,var(--blue));font-weight:700}
     .card{padding:16px}
@@ -109,25 +110,60 @@ HTML = """<!doctype html>
       margin-top:12px;max-height:180px;overflow:auto;padding:12px;border-radius:var(--r-md);background:rgba(2,9,15,.82);
       border:1px solid rgba(255,255,255,.05);color:#bed0e5;font-family:Consolas,"Cascadia Code",monospace;font-size:12px;line-height:1.5;white-space:pre-wrap
     }
-    .chat{display:grid;grid-template-rows:auto 1fr auto;min-height:0}
+    .chat{display:grid;grid-template-rows:auto auto 1fr auto;min-height:0}
     .chat-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;padding:18px 22px;border-bottom:1px solid var(--line);background:rgba(15,29,45,.96)}
+    .chat-head-main{min-width:0}
+    .chat-head-side{display:grid;gap:10px;justify-items:end}
     .chat-head h3{margin:0;font-family:"Bahnschrift","Segoe UI Semibold",sans-serif;font-size:24px;line-height:1.05}
     .chat-sub{margin-top:8px;color:var(--muted);font-size:13px;line-height:1.55}
-    .thread{min-height:0;overflow-y:auto;padding:22px;display:flex;flex-direction:column;gap:16px;background:linear-gradient(180deg,rgba(6,12,20,.45),rgba(10,19,31,.88))}
+    .runtime-pill{justify-self:end;border-color:rgba(255,177,99,.22);background:rgba(255,177,99,.08);color:#ffd4ab}
+    .summary-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;padding:14px 22px;border-bottom:1px solid var(--line);background:rgba(10,21,33,.82)}
+    .summary-card{padding:12px 14px;border-radius:var(--r-md);border:1px solid rgba(255,255,255,.06);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.02))}
+    .summary-k{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:700}
+    .summary-v{margin-top:7px;font-family:"Bahnschrift","Segoe UI Semibold",sans-serif;font-size:24px;line-height:1}
+    .summary-d{margin-top:8px;font-size:12px;line-height:1.45;color:var(--muted)}
+    .thread{min-height:0;overflow-y:auto;padding:22px;display:flex;flex-direction:column;gap:16px;background:
+      radial-gradient(circle at top right,rgba(104,180,255,.08),transparent 28%),
+      linear-gradient(180deg,rgba(6,12,20,.45),rgba(10,19,31,.88))}
     .welcome{padding:18px;border-radius:var(--r-lg);border:1px solid rgba(104,180,255,.12);background:rgba(104,180,255,.06);color:var(--muted);line-height:1.65}
     .msg{max-width:min(860px,84%);border-radius:20px;padding:15px 16px 14px;border:1px solid var(--line);background:rgba(255,255,255,.03);box-shadow:0 10px 26px rgba(0,0,0,.18)}
     .msg.user{align-self:flex-end;background:linear-gradient(145deg,rgba(34,93,158,.92),rgba(18,53,91,.94));border-color:rgba(104,180,255,.32)}
     .msg.bot{align-self:flex-start}
     .msg.pending{opacity:.72;border-style:dashed}
-    .who{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:700;margin-bottom:8px}
-    .body{white-space:pre-wrap;line-height:1.62;font-size:15px}
+    .msg-top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:10px}
+    .who{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:700}
+    .msg-time{font-size:12px;color:var(--muted)}
+    .body{display:grid;gap:12px;line-height:1.62;font-size:15px}
+    .body p,.body blockquote{margin:0}
+    .body ul,.body ol{margin:0;padding-left:22px}
+    .body li+li{margin-top:6px}
+    .body code{font-family:Consolas,"Cascadia Code",monospace;font-size:.92em;padding:2px 6px;border-radius:8px;background:rgba(255,255,255,.08)}
+    .code-block{border-radius:16px;border:1px solid rgba(104,180,255,.12);background:rgba(2,8,14,.88);overflow:hidden}
+    .code-head{padding:8px 12px;border-bottom:1px solid rgba(104,180,255,.10);font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:#a7c3e6;background:rgba(255,255,255,.03)}
+    .code-block pre{margin:0;padding:14px 16px;overflow-x:auto}
+    .code-block pre code{display:block;padding:0;border-radius:0;background:none}
+    .body blockquote{padding:10px 14px;border-left:3px solid rgba(104,180,255,.42);background:rgba(104,180,255,.06);border-radius:0 12px 12px 0;color:#d8e7f9}
     .meta{display:flex;flex-wrap:wrap;gap:12px;margin-top:10px;font-size:12px;color:var(--muted)}
-    .composer{display:grid;grid-template-columns:1fr auto;gap:12px;padding:18px 22px 22px;border-top:1px solid var(--line);background:rgba(9,18,29,.94)}
+    .msg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px;opacity:0;transition:opacity .16s ease}
+    .msg:hover .msg-actions,.msg:focus-within .msg-actions{opacity:1}
+    .mini-btn,.followup-btn{
+      display:inline-flex;align-items:center;gap:8px;padding:8px 11px;border-radius:999px;border:1px solid rgba(255,255,255,.08);
+      background:rgba(255,255,255,.04);color:var(--text);cursor:pointer;font:inherit;font-size:12px
+    }
+    .followup-row{display:flex;flex-wrap:wrap;gap:8px}
+    .followup-btn{background:rgba(104,180,255,.08);border-color:rgba(104,180,255,.16)}
+    .composer{display:grid;grid-template-columns:1fr auto;gap:12px;padding:18px 22px 22px;border-top:1px solid var(--line);background:var(--panel-3)}
+    .composer-main{display:grid;gap:10px}
     .composer textarea{min-height:76px;max-height:220px;font-size:15px}
     .send-col{display:grid;gap:10px;align-content:end;min-width:138px}
     .send-note{color:var(--muted);font-size:12px;text-align:right;line-height:1.4}
-    @media (max-width:1080px){body{overflow:auto}.shell{grid-template-columns:1fr;height:auto;min-height:calc(100vh - 28px)}.msg{max-width:100%}}
-    @media (max-width:700px){.shell{width:calc(100vw - 18px);margin:9px auto;gap:12px}.rail,.composer,.chat-head,.thread{padding-left:14px;padding-right:14px}.control-grid,.metric-grid{grid-template-columns:1fr 1fr}.composer{grid-template-columns:1fr}.send-col{min-width:0}.send-note{text-align:left}}
+    .toast-rack{position:fixed;right:18px;bottom:18px;display:grid;gap:10px;z-index:40;pointer-events:none}
+    .toast{min-width:240px;max-width:min(380px,calc(100vw - 28px));padding:12px 14px;border-radius:14px;border:1px solid rgba(255,255,255,.08);background:rgba(7,15,24,.94);box-shadow:0 16px 40px rgba(0,0,0,.28);color:var(--text)}
+    .toast.ok{border-color:rgba(141,216,168,.24)}
+    .toast.err{border-color:rgba(255,143,143,.30)}
+    @media (max-width:1080px){body{overflow:auto}.shell{grid-template-columns:1fr;height:auto;min-height:calc(100vh - 28px)}.msg{max-width:100%}.summary-strip{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media (max-width:700px){.shell{width:calc(100vw - 18px);margin:9px auto;gap:12px}.rail,.composer,.chat-head,.summary-strip,.thread{padding-left:14px;padding-right:14px}.control-grid,.metric-grid,.summary-strip{grid-template-columns:1fr 1fr}.chat-head{flex-direction:column}.chat-head-side{justify-items:start}.composer{grid-template-columns:1fr}.send-col{min-width:0}.send-note{text-align:left}}
+    @media (max-width:560px){.summary-strip{grid-template-columns:1fr}.toast-rack{left:12px;right:12px;bottom:12px}}
   </style>
 </head>
 <body>
@@ -178,7 +214,7 @@ HTML = """<!doctype html>
       </section>
 """
 
-HTML += """
+HTML += r"""
       <section class="card">
         <h2>Quick Prompts</h2>
         <div class="chip-row" id="starterChips"></div>
@@ -199,12 +235,38 @@ HTML += """
 
     <main class="panel chat">
       <header class="chat-head">
-        <div>
+        <div class="chat-head-main">
           <h3 id="chatTitle">Preparing local runtime...</h3>
           <div class="chat-sub" id="chatSub">The desktop launcher will open this view after the local model server reports ready.</div>
         </div>
-        <div class="pill" id="sessionBadge">session pending</div>
+        <div class="chat-head-side">
+          <div class="pill" id="sessionBadge">session pending</div>
+          <div class="pill runtime-pill" id="runtimeBadge">syncing runtime</div>
+        </div>
       </header>
+
+      <section class="summary-strip">
+        <div class="summary-card">
+          <div class="summary-k">Turns</div>
+          <div class="summary-v" id="turnCount">0</div>
+          <div class="summary-d" id="turnDetail">No conversation yet</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-k">Last Speed</div>
+          <div class="summary-v" id="speedValue">-</div>
+          <div class="summary-d" id="speedDetail">Awaiting first reply</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-k">Last Output</div>
+          <div class="summary-v" id="outputValue">-</div>
+          <div class="summary-d" id="outputDetail">No assistant output yet</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-k">Context</div>
+          <div class="summary-v" id="contextValue">0</div>
+          <div class="summary-d" id="contextDetail">Steering off</div>
+        </div>
+      </section>
 
       <section class="thread" id="thread">
         <div class="welcome" id="welcomeCard">
@@ -214,7 +276,10 @@ HTML += """
       </section>
 
       <footer class="composer">
-        <textarea id="prompt" placeholder="Type a message. Press Enter to send, Shift+Enter for a new line."></textarea>
+        <div class="composer-main">
+          <textarea id="prompt" placeholder="Type a message. Press Enter to send, Shift+Enter for a new line."></textarea>
+          <div class="followup-row" id="followupRow"></div>
+        </div>
         <div class="send-col">
           <button class="primary-btn" id="sendBtn">Send</button>
           <div class="send-note" id="sendNote">Preset: balanced</div>
@@ -222,10 +287,12 @@ HTML += """
       </footer>
     </main>
   </div>
+  <div class="toast-rack" id="toastRack"></div>
 
   <script>
     const SETTINGS_KEY = "supermix-qwen-v26-settings";
     const SESSION_KEY = "supermix-qwen-v26-session";
+    const HISTORY_KEY_PREFIX = "supermix-qwen-v26-history-";
     const PRESETS = {
       direct: { maxNew: 72, temp: 0.05, topP: 0.82 },
       balanced: { maxNew: 112, temp: 0.20, topP: 0.92 },
@@ -233,6 +300,12 @@ HTML += """
       creative: { maxNew: 200, temp: 0.58, topP: 0.97 },
       coding: { maxNew: 160, temp: 0.12, topP: 0.88 }
     };
+    const FOLLOW_UPS = [
+      { label: "Shorter", prompt: "Rewrite your last answer so it is shorter and more direct." },
+      { label: "Deeper", prompt: "Go one level deeper and explain the tradeoffs clearly." },
+      { label: "Runnable Code", prompt: "Turn your last answer into a small runnable example." },
+      { label: "Checklist", prompt: "Turn your last answer into a practical checklist." }
+    ];
     const STARTERS = [
       "Debug this stack trace and tell me the most likely root cause.",
       "Explain the tradeoffs between two ways to solve this problem.",
@@ -259,6 +332,7 @@ HTML += """
       chatTitle: document.getElementById("chatTitle"),
       chatSub: document.getElementById("chatSub"),
       sessionBadge: document.getElementById("sessionBadge"),
+      runtimeBadge: document.getElementById("runtimeBadge"),
       metricF1: document.getElementById("metricF1"),
       metricF1Delta: document.getElementById("metricF1Delta"),
       metricPpl: document.getElementById("metricPpl"),
@@ -267,7 +341,17 @@ HTML += """
       metricGenDelta: document.getElementById("metricGenDelta"),
       metricTrain: document.getElementById("metricTrain"),
       metricSamples: document.getElementById("metricSamples"),
-      welcomeCard: document.getElementById("welcomeCard")
+      welcomeCard: document.getElementById("welcomeCard"),
+      turnCount: document.getElementById("turnCount"),
+      turnDetail: document.getElementById("turnDetail"),
+      speedValue: document.getElementById("speedValue"),
+      speedDetail: document.getElementById("speedDetail"),
+      outputValue: document.getElementById("outputValue"),
+      outputDetail: document.getElementById("outputDetail"),
+      contextValue: document.getElementById("contextValue"),
+      contextDetail: document.getElementById("contextDetail"),
+      followupRow: document.getElementById("followupRow"),
+      toastRack: document.getElementById("toastRack")
     };
 
     const state = {
@@ -287,11 +371,173 @@ HTML += """
       return String(Date.now()) + "-" + Math.random().toString(16).slice(2, 10);
     }
 
+    function historyStorageKey(sessionId) {
+      return HISTORY_KEY_PREFIX + String(sessionId || "");
+    }
+
+    function formatClock(value) {
+      const date = value ? new Date(value) : new Date();
+      if (Number.isNaN(date.getTime())) return "";
+      return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+
+    function sanitizeStoredMessages(value) {
+      if (!Array.isArray(value)) return [];
+      return value.map((item) => {
+        if (!item || typeof item !== "object") return null;
+        const kind = item.kind === "user" ? "user" : item.kind === "bot" ? "bot" : "";
+        const text = String(item.text || "").trim();
+        if (!kind || !text) return null;
+        return {
+          kind: kind,
+          text: text,
+          meta: item.meta && typeof item.meta === "object" ? item.meta : {},
+          at: String(item.at || new Date().toISOString())
+        };
+      }).filter(Boolean).slice(-24);
+    }
+
+    function mountWelcomeCard() {
+      const welcome = document.createElement("div");
+      welcome.className = "welcome";
+      welcome.id = "welcomeCard";
+      welcome.textContent =
+        "Ask for debugging help, explanations, brainstorming, summaries, or code. The preset buttons tune style and generation, " +
+        "while Session Steering lets you bias the whole conversation without editing every prompt.";
+      els.thread.appendChild(welcome);
+      els.welcomeCard = welcome;
+    }
+
+    function renderConversation() {
+      els.thread.innerHTML = "";
+      els.welcomeCard = null;
+      if (!state.messages.length) {
+        mountWelcomeCard();
+        updateConversationSummary();
+        return;
+      }
+      state.messages.forEach((message) => addMessage(message.kind, message.text, message.meta || {}, { at: message.at }));
+      updateConversationSummary();
+    }
+
+    function saveConversation() {
+      if (!state.messages.length) {
+        localStorage.removeItem(historyStorageKey(state.sessionId));
+        return;
+      }
+      localStorage.setItem(historyStorageKey(state.sessionId), JSON.stringify(state.messages.slice(-24)));
+    }
+
+    function restoreConversation() {
+      let raw = null;
+      try {
+        raw = JSON.parse(localStorage.getItem(historyStorageKey(state.sessionId)) || "[]");
+      } catch (err) {
+        raw = [];
+      }
+      state.messages = sanitizeStoredMessages(raw);
+      state.lastBotText = "";
+      for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+        if (state.messages[index].kind === "bot" && !(state.messages[index].meta && state.messages[index].meta.local_only)) {
+          state.lastBotText = state.messages[index].text;
+          break;
+        }
+      }
+      renderConversation();
+    }
+
+    function showToast(text, kind) {
+      const node = document.createElement("div");
+      node.className = "toast " + (kind || "");
+      node.textContent = text;
+      els.toastRack.appendChild(node);
+      window.setTimeout(() => {
+        if (node.parentNode) node.parentNode.removeChild(node);
+      }, 2600);
+    }
+
+    async function copyText(text, successMessage) {
+      const value = String(text || "");
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        await navigator.clipboard.writeText(value);
+      } else {
+        const helper = document.createElement("textarea");
+        helper.value = value;
+        helper.setAttribute("readonly", "readonly");
+        helper.style.position = "fixed";
+        helper.style.opacity = "0";
+        document.body.appendChild(helper);
+        helper.select();
+        document.execCommand("copy");
+        document.body.removeChild(helper);
+      }
+      showToast(successMessage, "ok");
+    }
+
+    function setComposerPrompt(text, append) {
+      const next = append && els.prompt.value.trim()
+        ? els.prompt.value.trimEnd() + "\n\n" + text
+        : text;
+      els.prompt.value = next;
+      autoResizePrompt();
+      els.prompt.focus();
+    }
+
+    function quoteMessage(text) {
+      const quoted = String(text || "")
+        .split("\n")
+        .map((line) => "> " + line)
+        .join("\n");
+      setComposerPrompt(quoted + "\n", true);
+      showToast("Quoted into composer.", "ok");
+    }
+
+    function buildHistoryPayload() {
+      return state.messages
+        .filter((message) => (message.kind === "user" || message.kind === "bot") && !(message.meta && message.meta.local_only))
+        .slice(-20)
+        .map((message) => ({
+          role: message.kind === "bot" ? "assistant" : "user",
+          content: message.text
+        }));
+    }
+
+    function updateConversationSummary() {
+      const userTurns = state.messages.filter((message) => message.kind === "user").length;
+      const lastBot = [...state.messages].reverse().find((message) => message.kind === "bot" && !(message.meta && message.meta.local_only)) || null;
+      const historyDepth = buildHistoryPayload().length;
+
+      els.turnCount.textContent = String(userTurns);
+      els.turnDetail.textContent = userTurns ? ("session " + state.sessionId.slice(0, 8)) : "No conversation yet";
+
+      els.speedValue.textContent =
+        lastBot && Number.isFinite(Number(lastBot.meta && lastBot.meta.tokens_per_sec))
+          ? Number(lastBot.meta.tokens_per_sec).toFixed(2) + "/s"
+          : "-";
+      els.speedDetail.textContent =
+        lastBot && lastBot.meta && lastBot.meta.total_ms
+          ? ("last " + lastBot.meta.total_ms + " ms")
+          : "Awaiting first reply";
+
+      els.outputValue.textContent =
+        lastBot && lastBot.meta && lastBot.meta.output_tokens
+          ? String(lastBot.meta.output_tokens)
+          : "-";
+      els.outputDetail.textContent =
+        lastBot
+          ? ("preset " + String((lastBot.meta && lastBot.meta.preset_used) || state.settings.preset))
+          : "No assistant output yet";
+
+      els.contextValue.textContent = String(historyDepth);
+      els.contextDetail.textContent = state.settings.systemHint.trim() ? "Steering on" : "Steering off";
+    }
+
     function ensureSessionId() {
       const existing = localStorage.getItem(SESSION_KEY);
       state.sessionId = existing || makeSessionId();
       localStorage.setItem(SESSION_KEY, state.sessionId);
       els.sessionBadge.textContent = "session " + state.sessionId.slice(0, 8);
+      updateConversationSummary();
     }
 
     function syncPresetButtons() {
@@ -305,7 +551,9 @@ HTML += """
       els.sendNote.textContent =
         "Preset: " + state.settings.preset +
         " | " + profile.maxNew + " max tokens" +
-        " | T=" + Number(state.settings.temp).toFixed(2);
+        " | T=" + Number(state.settings.temp).toFixed(2) +
+        " | top-p " + Number(state.settings.topP).toFixed(2);
+      updateConversationSummary();
     }
 
     function loadSettings() {
@@ -347,7 +595,7 @@ HTML += """
     }
 """
 
-HTML += """
+HTML += r"""
     function setSending(flag) {
       state.sending = !!flag;
       els.sendBtn.disabled = state.sending;
@@ -371,14 +619,25 @@ HTML += """
     function summarizeStatus(status) {
       const profile = status.profile || {};
       const benchmark = profile.benchmark || {};
+      const targetModules = Array.isArray(profile.target_modules) ? profile.target_modules.length : 0;
+      const runtimeState = status.loaded ? ((status.device || "cpu") + " | adapter " + (status.adapter_loaded ? "ready" : "missing")) : "runtime not loaded";
       els.releaseLabel.textContent = profile.label || "Latest adapter";
-      els.deviceLabel.textContent = status.loaded ? ((status.device || "cpu") + " | adapter " + (status.adapter_loaded ? "ready" : "missing")) : "runtime not loaded";
+      els.deviceLabel.textContent = runtimeState;
+      els.runtimeBadge.textContent = status.loaded ? runtimeState : "syncing runtime";
       els.chatTitle.textContent = status.loaded ? ((profile.label || "Supermix Qwen") + " ready") : "Runtime not ready";
-      els.chatSub.textContent = status.loaded ? ("Base model: " + (profile.base_model || "unknown") + " | sessions: " + String(status.sessions || 0)) : "The local runtime is still starting or failed to load.";
+      els.chatSub.textContent = status.loaded
+        ? (
+          "Base model: " + (profile.base_model || "unknown") +
+          " | sessions: " + String(status.sessions || 0) +
+          " | targets: " + String(targetModules) +
+          (benchmark.available ? (" | eval F1 " + Number(benchmark.token_f1 || 0).toFixed(3)) : "")
+        )
+        : "The local runtime is still starting or failed to load.";
       els.adapterMetaLine.textContent =
         "LoRA r=" + String(profile.lora_rank || "-") +
         " | alpha=" + String(profile.lora_alpha || "-") +
         " | dropout=" + String(Number(profile.lora_dropout || 0).toFixed(2)) +
+        " | targets=" + String(targetModules) +
         " | DoRA " + (profile.use_dora ? "on" : "off") +
         " | rsLoRA " + (profile.use_rslora ? "on" : "off");
 
@@ -392,22 +651,139 @@ HTML += """
       els.metricSamples.textContent = benchmark.available ? ("eval " + String(benchmark.eval_samples || 0) + " samples") : "Awaiting adapter metadata";
       els.statusBox.textContent = JSON.stringify(status, null, 2);
       state.status = status;
+      updateConversationSummary();
     }
 
-    function addMessage(kind, text, meta) {
-      if (els.welcomeCard) els.welcomeCard.remove();
+    function appendInlineFormatted(target, text) {
+      const value = String(text || "");
+      const re = /`([^`]+)`/g;
+      let lastIndex = 0;
+      let match = re.exec(value);
+      while (match) {
+        if (match.index > lastIndex) {
+          target.appendChild(document.createTextNode(value.slice(lastIndex, match.index)));
+        }
+        const code = document.createElement("code");
+        code.textContent = match[1];
+        target.appendChild(code);
+        lastIndex = match.index + match[0].length;
+        match = re.exec(value);
+      }
+      if (lastIndex < value.length) {
+        target.appendChild(document.createTextNode(value.slice(lastIndex)));
+      }
+    }
+
+    function appendTextWithBreaks(target, text) {
+      const lines = String(text || "").split("\n");
+      lines.forEach((line, index) => {
+        appendInlineFormatted(target, line);
+        if (index < lines.length - 1) target.appendChild(document.createElement("br"));
+      });
+    }
+
+    function renderTextBlock(container, block) {
+      const lines = String(block || "").split("\n").map((line) => line.trimRight());
+      const nonEmpty = lines.filter((line) => line.trim());
+      if (!nonEmpty.length) return;
+
+      if (nonEmpty.every((line) => /^>\s?/.test(line))) {
+        const quote = document.createElement("blockquote");
+        appendTextWithBreaks(quote, nonEmpty.map((line) => line.replace(/^>\s?/, "")).join("\n"));
+        container.appendChild(quote);
+        return;
+      }
+
+      if (nonEmpty.every((line) => /^[-*]\s+/.test(line))) {
+        const list = document.createElement("ul");
+        nonEmpty.forEach((line) => {
+          const item = document.createElement("li");
+          appendInlineFormatted(item, line.replace(/^[-*]\s+/, ""));
+          list.appendChild(item);
+        });
+        container.appendChild(list);
+        return;
+      }
+
+      if (nonEmpty.every((line) => /^\d+\.\s+/.test(line))) {
+        const list = document.createElement("ol");
+        nonEmpty.forEach((line) => {
+          const item = document.createElement("li");
+          appendInlineFormatted(item, line.replace(/^\d+\.\s+/, ""));
+          list.appendChild(item);
+        });
+        container.appendChild(list);
+        return;
+      }
+
+      const paragraph = document.createElement("p");
+      appendTextWithBreaks(paragraph, nonEmpty.join("\n"));
+      container.appendChild(paragraph);
+    }
+
+    function renderMessageBody(text) {
+      const body = document.createElement("div");
+      body.className = "body";
+      const parts = String(text || "").replace(/\r\n/g, "\n").split(/```/);
+      parts.forEach((part, index) => {
+        if (!part) return;
+        if (index % 2 === 1) {
+          const block = document.createElement("div");
+          block.className = "code-block";
+          const codeHead = document.createElement("div");
+          codeHead.className = "code-head";
+          let codeText = part;
+          let lang = "code";
+          const newlineIndex = part.indexOf("\n");
+          if (newlineIndex >= 0) {
+            const possibleLang = part.slice(0, newlineIndex).trim();
+            if (/^[A-Za-z0-9_#+.-]{1,20}$/.test(possibleLang)) {
+              lang = possibleLang;
+              codeText = part.slice(newlineIndex + 1);
+            }
+          }
+          codeHead.textContent = lang;
+          const pre = document.createElement("pre");
+          const code = document.createElement("code");
+          code.textContent = codeText.replace(/^\n/, "");
+          pre.appendChild(code);
+          block.appendChild(codeHead);
+          block.appendChild(pre);
+          body.appendChild(block);
+          return;
+        }
+        part.split(/\n{2,}/).forEach((chunk) => renderTextBlock(body, chunk));
+      });
+      if (!body.childNodes.length) {
+        const paragraph = document.createElement("p");
+        paragraph.textContent = String(text || "");
+        body.appendChild(paragraph);
+      }
+      return body;
+    }
+
+    function addMessage(kind, text, meta, options) {
+      if (els.welcomeCard && els.welcomeCard.parentNode) {
+        els.welcomeCard.parentNode.removeChild(els.welcomeCard);
+        els.welcomeCard = null;
+      }
+      const opts = options || {};
       const node = document.createElement("article");
       node.className = "msg " + kind;
 
+      const top = document.createElement("div");
+      top.className = "msg-top";
       const who = document.createElement("div");
       who.className = "who";
       who.textContent = kind === "user" ? "You" : "Assistant";
-      node.appendChild(who);
+      const time = document.createElement("div");
+      time.className = "msg-time";
+      time.textContent = formatClock(opts.at);
+      top.appendChild(who);
+      top.appendChild(time);
+      node.appendChild(top);
 
-      const body = document.createElement("div");
-      body.className = "body";
-      body.textContent = text;
-      node.appendChild(body);
+      node.appendChild(renderMessageBody(text));
 
       if (meta) {
         const metaRow = document.createElement("div");
@@ -429,19 +805,49 @@ HTML += """
         if (metaRow.childNodes.length) node.appendChild(metaRow);
       }
 
+      if (!(meta && meta.pending)) {
+        const actions = document.createElement("div");
+        actions.className = "msg-actions";
+
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "mini-btn";
+        copyBtn.textContent = "Copy";
+        copyBtn.addEventListener("click", async () => {
+          try {
+            await copyText(text, kind === "bot" ? "Reply copied." : "Message copied.");
+          } catch (err) {
+            showToast("Copy failed: " + err.message, "err");
+          }
+        });
+        actions.appendChild(copyBtn);
+
+        const quoteBtn = document.createElement("button");
+        quoteBtn.type = "button";
+        quoteBtn.className = "mini-btn";
+        quoteBtn.textContent = "Quote";
+        quoteBtn.addEventListener("click", () => quoteMessage(text));
+        actions.appendChild(quoteBtn);
+
+        node.appendChild(actions);
+      }
+
       els.thread.appendChild(node);
       els.thread.scrollTop = els.thread.scrollHeight;
       return node;
     }
 
     function rememberMessage(kind, text, meta) {
-      state.messages.push({ kind: kind, text: text, meta: meta || {}, at: new Date().toISOString() });
-      if (kind === "bot") state.lastBotText = text;
+      const safeMeta = meta || {};
+      state.messages.push({ kind: kind, text: text, meta: safeMeta, at: new Date().toISOString() });
+      if (kind === "bot" && !safeMeta.local_only) state.lastBotText = text;
+      saveConversation();
+      updateConversationSummary();
     }
 
     function setPendingMessage() {
       if (state.pendingNode) return;
-      const node = addMessage("bot", "Working on it...", { pending: "running local generation" });
+      const node = addMessage("bot", "Working on it...", { pending: "running local generation" }, { at: new Date().toISOString() });
       node.classList.add("pending");
       state.pendingNode = node;
     }
@@ -475,6 +881,7 @@ HTML += """
         summarizeStatus(data.status);
       } catch (err) {
         els.statusBox.textContent = "Status error: " + err.message;
+        els.runtimeBadge.textContent = "status error";
       }
     }
 
@@ -486,7 +893,8 @@ HTML += """
     async function sendMessage() {
       const text = els.prompt.value.trim();
       if (!text || state.sending) return;
-      addMessage("user", text);
+      const history = buildHistoryPayload();
+      addMessage("user", text, {}, { at: new Date().toISOString() });
       rememberMessage("user", text);
       els.prompt.value = "";
       autoResizePrompt();
@@ -495,6 +903,7 @@ HTML += """
       try {
         const data = await jpost("/api/chat", {
           session_id: state.sessionId,
+          history: history,
           message: text,
           preset: state.settings.preset,
           system_hint: state.settings.systemHint,
@@ -503,13 +912,13 @@ HTML += """
           top_p: Number(state.settings.topP)
         });
         clearPendingMessage();
-        addMessage("bot", data.response, data.timing || {});
+        addMessage("bot", data.response, data.timing || {}, { at: new Date().toISOString() });
         rememberMessage("bot", data.response, data.timing || {});
       } catch (err) {
         clearPendingMessage();
         const textOut = "Error: " + err.message;
-        addMessage("bot", textOut);
-        rememberMessage("bot", textOut);
+        addMessage("bot", textOut, { local_only: true }, { at: new Date().toISOString() });
+        rememberMessage("bot", textOut, { local_only: true });
       } finally {
         setSending(false);
       }
@@ -517,40 +926,40 @@ HTML += """
 
     async function clearSession(remote) {
       if (remote !== false) {
-        try { await jpost("/api/clear", { session_id: state.sessionId }); } catch (err) {
-          addMessage("bot", "Clear error: " + err.message);
-          rememberMessage("bot", "Clear error: " + err.message);
+        try {
+          await jpost("/api/clear", { session_id: state.sessionId });
+        } catch (err) {
+          showToast("Clear failed: " + err.message, "err");
           return;
         }
       }
       state.messages = [];
       state.lastBotText = "";
-      els.thread.innerHTML = "";
-      const welcome = document.createElement("div");
-      welcome.className = "welcome";
-      welcome.id = "welcomeCard";
-      welcome.textContent = "Ask for debugging help, explanations, brainstorming, summaries, or code. The preset buttons tune style and generation, while Session Steering lets you bias the whole conversation without editing every prompt.";
-      els.thread.appendChild(welcome);
-      addMessage("bot", "Session cleared. The local runtime is ready for a new conversation.");
-      rememberMessage("bot", "Session cleared. The local runtime is ready for a new conversation.");
+      saveConversation();
+      renderConversation();
+      showToast("Session cleared.", "ok");
     }
 
     function newSession() {
       state.sessionId = makeSessionId();
       localStorage.setItem(SESSION_KEY, state.sessionId);
       els.sessionBadge.textContent = "session " + state.sessionId.slice(0, 8);
-      clearSession(false);
+      state.messages = [];
+      state.lastBotText = "";
+      saveConversation();
+      renderConversation();
+      showToast("Started a new blank session.", "ok");
     }
 
     async function copyLastReply() {
-      if (!state.lastBotText) return;
+      if (!state.lastBotText) {
+        showToast("No assistant reply to copy yet.", "err");
+        return;
+      }
       try {
-        await navigator.clipboard.writeText(state.lastBotText);
-        addMessage("bot", "Last reply copied to the clipboard.");
-        rememberMessage("bot", "Last reply copied to the clipboard.");
+        await copyText(state.lastBotText, "Last reply copied.");
       } catch (err) {
-        addMessage("bot", "Copy failed: " + err.message);
-        rememberMessage("bot", "Copy failed: " + err.message);
+        showToast("Copy failed: " + err.message, "err");
       }
     }
 
@@ -558,6 +967,7 @@ HTML += """
       const payload = {
         exported_at: new Date().toISOString(),
         session_id: state.sessionId,
+        settings: state.settings,
         profile: state.status ? (state.status.profile || {}) : {},
         messages: state.messages
       };
@@ -570,13 +980,14 @@ HTML += """
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
+      showToast("Chat exported.", "ok");
     }
 
     function bindInputs() {
       els.maxNew.addEventListener("input", () => { state.settings.maxNew = Math.max(24, Number(els.maxNew.value) || 112); updateSendNote(); saveSettings(); });
       els.temp.addEventListener("input", () => { const value = Number(els.temp.value); state.settings.temp = Number.isFinite(value) ? value : 0.20; updateSendNote(); saveSettings(); });
-      els.topP.addEventListener("input", () => { const value = Number(els.topP.value); state.settings.topP = Number.isFinite(value) ? value : 0.92; saveSettings(); });
-      els.systemHint.addEventListener("input", () => { state.settings.systemHint = els.systemHint.value; saveSettings(); });
+      els.topP.addEventListener("input", () => { const value = Number(els.topP.value); state.settings.topP = Number.isFinite(value) ? value : 0.92; updateSendNote(); saveSettings(); });
+      els.systemHint.addEventListener("input", () => { state.settings.systemHint = els.systemHint.value; updateSendNote(); saveSettings(); });
       document.querySelectorAll("[data-preset]").forEach((btn) => btn.addEventListener("click", () => applyPreset(btn.dataset.preset, true)));
       els.prompt.addEventListener("input", autoResizePrompt);
       els.prompt.addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } });
@@ -598,10 +1009,29 @@ HTML += """
       });
     }
 
+    function initFollowupChips() {
+      FOLLOW_UPS.forEach((item) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "followup-btn";
+        button.textContent = item.label;
+        button.addEventListener("click", () => {
+          if (!state.lastBotText) {
+            showToast("Ask the model something first.", "err");
+            return;
+          }
+          setComposerPrompt(item.prompt, false);
+        });
+        els.followupRow.appendChild(button);
+      });
+    }
+
     ensureSessionId();
     loadSettings();
+    restoreConversation();
     bindInputs();
     initStarterChips();
+    initFollowupChips();
     autoResizePrompt();
     refreshStatus();
     setInterval(refreshStatus, 15000);
@@ -729,6 +1159,23 @@ def clamp_float(value: Any, minimum: float, maximum: float, fallback: float) -> 
     except Exception:
         return float(fallback)
     return max(minimum, min(maximum, number))
+
+
+def normalize_history_payload(value: Any) -> List[Dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    cleaned: List[Dict[str, str]] = []
+    for item in value[-20:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        cleaned.append({"role": role, "content": content[:4000]})
+    return cleaned[-12:]
 
 
 def slug_to_label(value: str) -> str:
@@ -1074,6 +1521,7 @@ class Engine:
         top_p: float,
         preset: str,
         system_hint: str,
+        history_override: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         if not user_text.strip():
             raise ValueError("Empty message")
@@ -1083,7 +1531,8 @@ class Engine:
         system_hint = str(system_hint or "").strip()[:320]
 
         with self.lock:
-            history = list(self.sessions.get(session_id, []))[-12:]
+            stored_history = list(self.sessions.get(session_id, []))[-12:]
+        history = list(history_override)[-12:] if history_override is not None else stored_history
 
         prompt = self._build_prompt(history, user_text, preset_name, system_hint)
         inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1536).to(self.device)
@@ -1259,6 +1708,7 @@ def build_app(engine: Engine) -> Flask:
         session_id = str(payload.get("session_id") or "").strip() or str(uuid.uuid4())
         message = str(payload.get("message") or "").strip()
         preset = str(payload.get("preset") or "balanced").strip().lower()
+        history_override = normalize_history_payload(payload.get("history")) if "history" in payload else None
         try:
             return jsonify(
                 engine.chat(
@@ -1269,6 +1719,7 @@ def build_app(engine: Engine) -> Flask:
                     top_p=float(payload.get("top_p") or PRESET_GENERATION["balanced"]["top_p"]),
                     preset=preset,
                     system_hint=str(payload.get("system_hint") or ""),
+                    history_override=history_override,
                 )
             )
         except Exception as exc:

@@ -1,5 +1,6 @@
 import argparse
 import gc
+import hashlib
 import json
 import math
 import random
@@ -9,7 +10,7 @@ import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import torch
@@ -26,6 +27,7 @@ from chat_pipeline import (
     resolve_feature_mode,
     text_to_model_input,
 )
+from device_utils import configure_torch_runtime, resolve_device as resolve_runtime_device
 from model_variants import (
     build_model,
     detect_large_head_expansion_dim,
@@ -73,7 +75,20 @@ class PairAlignmentMetrics:
     conversation: float = 0.0
     reasoning: float = 0.0
     creativity: float = 0.0
+    clarification: float = 0.0
+    constraint: float = 0.0
+    is_ambiguous: bool = False
     is_followup: bool = False
+
+
+@dataclass
+class ResumeCheckpoint:
+    adapter_dir: Path
+    stage: str
+    sft_steps: int = 0
+    preference_steps: int = 0
+    sft_loss_mean: float = 0.0
+    preference_loss_mean: float = 0.0
 
 
 def _coerce_text(value: object) -> str:
@@ -99,10 +114,11 @@ def _pairs_from_messages(messages: Sequence[Dict[str, object]]) -> List[ChatPair
         if role == "assistant" and pending_user:
             user_text = pending_user
             if history:
+                max_turns = 5 if (FOLLOWUP_HINT_RE.search(pending_user) or len(pending_user.split()) <= 12) else 4
                 user_text = build_context(
-                    history=history[-3:],
+                    history=history[-max_turns:],
                     user_text=pending_user,
-                    max_turns=3,
+                    max_turns=max_turns,
                 )
             out.append(ChatPair(user=user_text, assistant=text))
             history.append((pending_user, text))
@@ -113,6 +129,25 @@ def _pairs_from_messages(messages: Sequence[Dict[str, object]]) -> List[ChatPair
 ARTIFACT_TAG_RE = re.compile(
     r"\[[^\]\n]*(?:variant|worked solution|set\d+|reflective|counterexample|debug|planning|mentor|teaching)[^\]\n]*\]",
     flags=re.IGNORECASE,
+)
+SYNTHETIC_SET_TOKEN_RE = re.compile(r"\b[a-z]+(?:-[a-z]+){0,3}-set\d+\b", flags=re.IGNORECASE)
+GENRE_VARIANT_PAREN_RE = re.compile(
+    r"\(\s*[^()\n]{0,120}\bgenre variant\b[^()\n]{0,80}\)",
+    flags=re.IGNORECASE,
+)
+ASSISTANT_STYLE_LEAD_RE = re.compile(
+    r"^(?:start with|try|using|use|let's use|take|consider|from|build)\s+(?:an?\s+)?"
+    r"[a-z][a-z0-9 \-]{0,72}\s+(?:frame|lens|angle|comparison|walkthrough|interpretation|thought experiment|"
+    r"mental model|breakdown|analysis|approach|explanation)(?:\s+for [^:]{0,72})?\s*[:\-]\s*",
+    flags=re.IGNORECASE,
+)
+SYNTHETIC_META_PHRASES = (
+    "debate framing",
+    "genre variant",
+    "worked solution",
+    "this socratic seed trains",
+    "this variant adds",
+    "for beginners and advanced learners",
 )
 LEAD_ARTIFACT_PHRASES = (
     "let me reason through this carefully.",
@@ -126,6 +161,10 @@ LOW_QUALITY_ASSISTANT_SNIPPETS = (
     "for beginners and advanced learners",
     "core mechanismbeh",
     "mechanismbehordes",
+    "rests on several pillars",
+    "that said, a thoughtful discussion",
+    "this socratic seed trains",
+    "this variant adds",
 )
 PLACEHOLDER_BRACKET_RESPONSE_RE = re.compile(r"^\[[^\]\n]{12,260}\]$", flags=re.IGNORECASE)
 PLACEHOLDER_ASSISTANT_SNIPPETS = (
@@ -225,6 +264,10 @@ FOLLOWUP_HINT_RE = re.compile(
     r"\b(it|that|this|they|them|same|again|continue|deeper|expand|shorter|longer|rewrite|rephrase|refine|improve|make it|more like)\b",
     flags=re.IGNORECASE,
 )
+AMBIGUOUS_EDIT_RE = re.compile(
+    r"\b(make it better|improve it|fix this|change it|same but better|more like that|do that again)\b",
+    flags=re.IGNORECASE,
+)
 SHORTEN_HINT_RE = re.compile(
     r"\b(shorter|short version|brief|concise|trim|compress|tldr|one sentence|summarize)\b",
     flags=re.IGNORECASE,
@@ -243,6 +286,11 @@ CREATIVE_REQUEST_RE = re.compile(
 )
 REASONING_REQUEST_RE = re.compile(
     r"\b(explain|why|how|analy[sz]e|reason|derive|prove|tradeoff|step by step|debug)\b",
+    flags=re.IGNORECASE,
+)
+EXPLICIT_TARGET_RE = re.compile(r"`[^`]{2,}`|\"[^\"]{2,}\"|'[^']{2,}'")
+CLARIFICATION_RESPONSE_RE = re.compile(
+    r"\b(which part|what part|what exactly|what do you want me to|which answer|paste the text|share the text|what topic|what are you referring to|what would you like)\b",
     flags=re.IGNORECASE,
 )
 SIGNIFICANT_TOKEN_RE = re.compile(r"[a-z0-9_+\-']+")
@@ -347,6 +395,20 @@ def _looks_like_placeholder_assistant(text: str) -> bool:
     return False
 
 
+def _synthetic_artifact_hits(text: str) -> int:
+    t = _normalize_whitespace(_coerce_text(text))
+    if not t:
+        return 0
+    low = t.lower()
+    hits = len(SYNTHETIC_SET_TOKEN_RE.findall(t))
+    hits += sum(1 for phrase in SYNTHETIC_META_PHRASES if phrase in low)
+    if ASSISTANT_STYLE_LEAD_RE.match(t):
+        hits += 1
+    if "rests on several pillars" in low and ("the for case" in low or "the against case" in low):
+        hits += 1
+    return hits
+
+
 def _latest_user_text(text: str) -> str:
     raw = _normalize_whitespace(_coerce_text(text))
     if not raw:
@@ -382,6 +444,10 @@ def _is_synthetic_template_prompt(user_text: str) -> bool:
         return True
     if SYNTHETIC_PROMPT_RE.search(low):
         return True
+    if SYNTHETIC_SET_TOKEN_RE.search(text):
+        return True
+    if any(phrase in low for phrase in ("debate framing", "genre variant", "worked solution")):
+        return True
     return False
 
 
@@ -396,9 +462,99 @@ def _prompt_signature(text: str) -> str:
         "in a <domain>",
         low,
     )
+    low = SYNTHETIC_SET_TOKEN_RE.sub(" <settag> ", low)
+    low = GENRE_VARIANT_PAREN_RE.sub(" ", low)
+    low = re.sub(r"\b(?:debate framing|genre variant|worked solution)\b", " ", low, flags=re.IGNORECASE)
     low = re.sub(r"\d+", " <num> ", low)
     low = re.sub(r"\s+", " ", low).strip()
     return low[:220]
+
+
+def _replace_last_user_turn(prompt_text: str, new_latest_user: str) -> str:
+    raw = _normalize_whitespace(_coerce_text(prompt_text))
+    new_latest_user = _normalize_whitespace(_coerce_text(new_latest_user))
+    if not raw or not new_latest_user:
+        return new_latest_user or raw
+    lines = raw.splitlines()
+    for idx in range(len(lines) - 1, -1, -1):
+        match = CONTEXT_ROLE_LINE_RE.match(lines[idx].strip())
+        if match and str(match.group(1)).strip().lower() == "user":
+            lines[idx] = f"User: {new_latest_user}"
+            return "\n".join(lines)
+    return new_latest_user
+
+
+def _followup_paraphrase_variants(user_text: str, max_variants: int) -> List[str]:
+    limit = max(0, int(max_variants))
+    if limit <= 0:
+        return []
+
+    latest_user = _latest_user_text(user_text)
+    if not latest_user:
+        return []
+    low = latest_user.lower()
+
+    variants: List[str] = []
+    if SHORTEN_HINT_RE.search(low) and REWRITE_HINT_RE.search(low):
+        variants.append("Give me a shorter, clearer version.")
+    if EXPAND_HINT_RE.search(low) and REASONING_REQUEST_RE.search(low):
+        variants.append("Go deeper and walk through it step by step.")
+    if SHORTEN_HINT_RE.search(low):
+        variants.extend(
+            [
+                "Give me a shorter version.",
+                "Can you make that more concise?",
+            ]
+        )
+    if EXPAND_HINT_RE.search(low):
+        variants.extend(
+            [
+                "Go deeper on that.",
+                "Can you expand on that with more detail?",
+            ]
+        )
+    if REWRITE_HINT_RE.search(low):
+        variants.extend(
+            [
+                "Rephrase that more clearly.",
+                "Say the same thing, but clearer.",
+            ]
+        )
+    if CREATIVE_REQUEST_RE.search(low):
+        variants.extend(
+            [
+                "Make it more vivid and creative.",
+                "Give it a more imaginative spin.",
+            ]
+        )
+    if REASONING_REQUEST_RE.search(low):
+        variants.extend(
+            [
+                "Explain it step by step.",
+                "Walk me through the reasoning.",
+            ]
+        )
+    if FOLLOWUP_HINT_RE.search(low) and not variants:
+        variants.extend(
+            [
+                "Continue from the last answer.",
+                "Build on what you just said.",
+            ]
+        )
+
+    out: List[str] = []
+    seen: set = set()
+    base_key = " ".join(latest_user.lower().split())
+    for variant in variants:
+        cleaned = _normalize_whitespace(variant)
+        key = " ".join(cleaned.lower().split())
+        if not cleaned or key == base_key or key in seen:
+            continue
+        seen.add(key)
+        out.append(_replace_last_user_turn(user_text, cleaned))
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _clean_training_text(text: str, is_user: bool) -> str:
@@ -406,8 +562,21 @@ def _clean_training_text(text: str, is_user: bool) -> str:
     if not out:
         return ""
 
+    raw_artifact_hits = _synthetic_artifact_hits(out)
     out = ARTIFACT_TAG_RE.sub(" ", out)
     out = _strip_leading_bracket_tags(out)
+    out = GENRE_VARIANT_PAREN_RE.sub(" ", out)
+    if not is_user:
+        out = SYNTHETIC_SET_TOKEN_RE.sub(" ", out)
+        out = re.sub(r"\b(?:debate framing|genre variant|worked solution)\b", " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"\b(?:this socratic seed trains|this variant adds)\b[^.?!]*[.?!]?", " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bfor beginners and advanced learners\b", " ", out, flags=re.IGNORECASE)
+        if raw_artifact_hits > 0:
+            for _ in range(3):
+                nxt = ASSISTANT_STYLE_LEAD_RE.sub("", out, count=1).strip()
+                if nxt == out:
+                    break
+                out = nxt
     if not is_user:
         lowered = out.lower()
         changed = True
@@ -428,6 +597,16 @@ def _fast_cleanup_response_text(text: str) -> str:
         return ""
     out = ARTIFACT_TAG_RE.sub(" ", out)
     out = _strip_leading_bracket_tags(out)
+    out = GENRE_VARIANT_PAREN_RE.sub(" ", out)
+    out = SYNTHETIC_SET_TOKEN_RE.sub(" ", out)
+    out = re.sub(r"\b(?:debate framing|genre variant|worked solution)\b", " ", out, flags=re.IGNORECASE)
+    out = re.sub(r"\b(?:this socratic seed trains|this variant adds)\b[^.?!]*[.?!]?", " ", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bfor beginners and advanced learners\b", " ", out, flags=re.IGNORECASE)
+    for _ in range(3):
+        nxt = ASSISTANT_STYLE_LEAD_RE.sub("", out, count=1).strip()
+        if nxt == out:
+            break
+        out = nxt
     return _normalize_whitespace(out)
 
 
@@ -442,6 +621,8 @@ def _is_quality_pair(user_text: str, assistant_text: str, min_chars: int) -> boo
     if assistant_text.count("[") + assistant_text.count("]") > 4:
         return False
     if ARTIFACT_TAG_RE.search(assistant_text):
+        return False
+    if _synthetic_artifact_hits(assistant_text) > 0:
         return False
     low = assistant_text.lower()
     for snippet in LOW_QUALITY_ASSISTANT_SNIPPETS:
@@ -837,22 +1018,45 @@ class SupermixTeacher:
 
     @torch.no_grad()
     def generate(self, user_text: str) -> str:
+        candidates = self.generate_candidates(user_text, temperatures=(0.0,))
+        return candidates[0] if candidates else ""
+
+    @torch.no_grad()
+    def generate_candidates(self, user_text: str, temperatures: Sequence[float]) -> List[str]:
         context = build_context(history=[], user_text=user_text, max_turns=0)
         x = text_to_model_input(context, feature_mode=self.feature_mode).to(self.device)
         logits = self.model(x)[0, 0]
         bucket = choose_bucket_from_logits(logits, self.available_labels, temperature=0.0)
         candidates = self.buckets.get(int(bucket), [])
         if not candidates:
-            return ""
-        response = pick_response(
-            candidates=candidates,
-            query_text=user_text,
-            recent_assistant_messages=[],
-            response_temperature=0.0,
-            style_mode="balanced",
-            creativity=0.0,
-        )
-        return _fast_cleanup_response_text(response)
+            return []
+        out: List[str] = []
+        seen: set = set()
+        temp_list = list(temperatures) if temperatures else [0.0]
+        for temp in temp_list:
+            response = pick_response(
+                candidates=candidates,
+                query_text=user_text,
+                recent_assistant_messages=[],
+                response_temperature=max(0.0, float(temp)),
+                style_mode="balanced",
+                creativity=0.0,
+            )
+            cleaned = _fast_cleanup_response_text(response)
+            if not cleaned:
+                continue
+            key = " ".join(cleaned.lower().split())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(cleaned)
+        return out
+
+
+def _distill_candidate_temperatures(best_of: int) -> Tuple[float, ...]:
+    best = max(1, int(best_of))
+    preset = (0.0, 0.22, 0.45, 0.72)
+    return tuple(float(x) for x in preset[:best])
 
 
 def apply_supermix_distillation(
@@ -862,9 +1066,11 @@ def apply_supermix_distillation(
     max_teacher_samples: int,
     seed: int,
     min_quality_score: float = 0.0,
+    min_quality_gain: float = 0.0,
     skip_synthetic_prompts: bool = True,
     log_every: int = 50,
     max_seconds: float = 0.0,
+    best_of: int = 1,
 ) -> Tuple[List[ChatPair], int]:
     if ratio <= 0 or max_teacher_samples <= 0:
         return train_pairs, 0
@@ -884,13 +1090,16 @@ def apply_supermix_distillation(
     print(
         "[distill] config: "
         f"target={n_target} ratio={float(ratio):.3f} "
-        f"max_seconds={max_seconds if max_seconds > 0 else 'off'}"
+        f"max_seconds={max_seconds if max_seconds > 0 else 'off'} "
+        f"best_of={max(1, int(best_of))} "
+        f"min_gain={max(0.0, float(min_quality_gain)):.3f}"
     )
 
     mixed = list(train_pairs)
     generated = 0
     chosen_sorted = sorted(chosen)
     visited = 0
+    candidate_temperatures = _distill_candidate_temperatures(best_of=int(best_of))
     for idx in chosen_sorted:
         visited += 1
         if max_seconds > 0 and (time.time() - started) >= max_seconds:
@@ -903,24 +1112,31 @@ def apply_supermix_distillation(
         pair = train_pairs[idx]
         if bool(skip_synthetic_prompts) and _is_synthetic_template_prompt(pair.user):
             continue
-        teacher_resp = teacher.generate(pair.user)
-        if not teacher_resp:
+        base_score, _base_alignment = _paired_response_score(pair.user, pair.assistant)
+        required_score = max(float(min_quality_score), base_score + max(0.0, float(min_quality_gain)))
+        best_response = ""
+        best_score = -1e9
+        for teacher_resp in teacher.generate_candidates(pair.user, temperatures=candidate_temperatures):
+            teacher_resp = _clean_training_text(teacher_resp, is_user=False)
+            if not teacher_resp:
+                continue
+            if _looks_like_placeholder_assistant(teacher_resp):
+                continue
+            if not _is_quality_pair(pair.user, teacher_resp, min_chars=4):
+                continue
+            teacher_score, _alignment = _paired_response_score(pair.user, teacher_resp)
+            if teacher_score < required_score:
+                continue
+            key = (pair.user, teacher_resp)
+            if key in seen_keys:
+                continue
+            if teacher_score > best_score:
+                best_score = teacher_score
+                best_response = teacher_resp
+        if not best_response:
             continue
-        teacher_resp = _clean_training_text(teacher_resp, is_user=False)
-        if not teacher_resp:
-            continue
-        if _looks_like_placeholder_assistant(teacher_resp):
-            continue
-        if not _is_quality_pair(pair.user, teacher_resp, min_chars=4):
-            continue
-        teacher_score, _alignment = _paired_response_score(pair.user, teacher_resp)
-        if teacher_score < float(min_quality_score):
-            continue
-        key = (pair.user, teacher_resp)
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        mixed.append(ChatPair(user=pair.user, assistant=teacher_resp, source="supermix_teacher"))
+        seen_keys.add((pair.user, best_response))
+        mixed.append(ChatPair(user=pair.user, assistant=best_response, source="supermix_teacher"))
         generated += 1
         if log_every > 0 and visited % log_every == 0:
             elapsed = max(1e-6, time.time() - started)
@@ -1021,20 +1237,37 @@ def build_rows(
     pairs: Sequence[ChatPair],
     max_length: int,
     row_weight_fn=None,
+    followup_paraphrase_aug: int = 0,
+    followup_paraphrase_weight: float = 0.72,
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
+    augmented_rows = 0
     for pair in pairs:
+        base_weight = 1.0
+        if row_weight_fn is not None:
+            try:
+                base_weight = float(row_weight_fn(pair))
+            except Exception:
+                base_weight = 1.0
         row = encode_for_causal_lm(tokenizer, pair, max_length=max_length)
         if row is not None:
             if row_weight_fn is not None:
-                try:
-                    w = float(row_weight_fn(pair))
-                except Exception:
-                    w = 1.0
-                row["sample_weight"] = float(max(0.05, w))
+                row["sample_weight"] = float(max(0.05, base_weight))
             rows.append(row)
+        if int(followup_paraphrase_aug) > 0:
+            for variant_user in _followup_paraphrase_variants(pair.user, max_variants=int(followup_paraphrase_aug)):
+                aug_pair = ChatPair(user=variant_user, assistant=pair.assistant, source=pair.source)
+                aug_row = encode_for_causal_lm(tokenizer, aug_pair, max_length=max_length)
+                if aug_row is None:
+                    continue
+                aug_weight = float(max(0.05, base_weight * float(followup_paraphrase_weight)))
+                aug_row["sample_weight"] = aug_weight
+                rows.append(aug_row)
+                augmented_rows += 1
     if not rows:
         raise ValueError("No valid rows produced after tokenization.")
+    if augmented_rows > 0:
+        print(f"[sft] added {augmented_rows} follow-up paraphrase augmentation rows")
     return rows
 
 
@@ -1073,31 +1306,42 @@ def _set_model_use_cache(model, enabled: bool) -> None:
         base_cfg.use_cache = use_cache
 
 
-def _resolve_device(device_spec: str) -> torch.device:
-    mode = str(device_spec).strip().lower()
-    if mode == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        mps_backend = getattr(torch.backends, "mps", None)
-        if mps_backend is not None and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    if mode == "cuda":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        print("[runtime] requested cuda but unavailable; falling back to cpu.")
-        return torch.device("cpu")
-    if mode == "mps":
-        mps_backend = getattr(torch.backends, "mps", None)
-        if mps_backend is not None and torch.backends.mps.is_available():
-            return torch.device("mps")
-        print("[runtime] requested mps but unavailable; falling back to cpu.")
-        return torch.device("cpu")
-    return torch.device("cpu")
+def _device_backend_name(device: Any, resolved_backend: str = "") -> str:
+    backend = str(resolved_backend or "").strip().lower()
+    if backend:
+        return backend
+    device_type = str(getattr(device, "type", "") or "").strip().lower()
+    if device_type == "privateuseone":
+        return "dml"
+    if device_type:
+        return device_type
+    return str(device).strip().lower() or "cpu"
 
 
-def _resolve_torch_dtype(dtype_spec: str, device: torch.device) -> torch.dtype:
+def _resolve_device(device_spec: str, device_preference: str = "cuda,npu,xpu,dml,mps,cpu") -> Tuple[Any, Dict[str, str]]:
+    device, info = resolve_runtime_device(
+        device_spec=str(device_spec),
+        preference=str(device_preference),
+    )
+    resolved_backend = _device_backend_name(device=device, resolved_backend=str(info.get("resolved", "")))
+    requested = str(info.get("requested", device_spec or "auto")).strip().lower() or "auto"
+    if requested != resolved_backend:
+        print(
+            "[runtime] device resolve: "
+            f"requested={requested} preference={str(device_preference).strip()} "
+            f"resolved={resolved_backend} device={device}"
+        )
+    return device, {
+        "requested": requested,
+        "resolved": resolved_backend,
+        "device_repr": str(device),
+        "preference": str(device_preference).strip(),
+    }
+
+
+def _resolve_torch_dtype(dtype_spec: str, device: Any, resolved_backend: str = "") -> torch.dtype:
     mode = str(dtype_spec).strip().lower()
+    backend = _device_backend_name(device=device, resolved_backend=resolved_backend)
     explicit = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -1106,14 +1350,14 @@ def _resolve_torch_dtype(dtype_spec: str, device: torch.device) -> torch.dtype:
     if mode in explicit:
         resolved = explicit[mode]
     else:
-        if device.type == "cuda":
+        if backend == "cuda":
             supports_bf16 = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
             resolved = torch.bfloat16 if supports_bf16 else torch.float16
-        elif device.type == "mps":
+        elif backend in {"mps", "dml", "npu", "xpu"}:
             resolved = torch.float16
         else:
             resolved = torch.float32
-    if device.type == "cpu" and resolved != torch.float32:
+    if backend == "cpu" and resolved != torch.float32:
         print("[runtime] cpu training requires float32 weights; overriding requested dtype.")
         return torch.float32
     return resolved
@@ -1121,7 +1365,7 @@ def _resolve_torch_dtype(dtype_spec: str, device: torch.device) -> torch.dtype:
 
 def _load_base_model_and_tokenizer(
     base_model: str,
-    device: torch.device,
+    device: Any,
     for_training: bool = True,
     model_dtype: torch.dtype = torch.float32,
     gradient_checkpointing: bool = False,
@@ -1157,6 +1401,66 @@ def _parse_lora_init_mode(value: str):
     return value
 
 
+def _is_lora_b_parameter(name: str) -> bool:
+    low = str(name).strip().lower()
+    return any(token in low for token in ("lora_b", "lora_embedding_b"))
+
+
+def _build_optimizer_param_groups(
+    model,
+    base_lr: float,
+    weight_decay: float,
+    lora_plus_ratio: float = 0.0,
+) -> Tuple[List[Dict[str, object]], Dict[str, float]]:
+    named_trainable = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    base_lr = float(base_lr)
+    ratio = float(lora_plus_ratio)
+    weight_decay = float(weight_decay)
+    if ratio <= 1.0:
+        return (
+            [{"params": [param for _name, param in named_trainable], "lr": base_lr, "weight_decay": weight_decay}],
+            {
+                "trainable_params": float(len(named_trainable)),
+                "lora_plus_ratio": 0.0,
+                "lora_plus_base_group_params": float(len(named_trainable)),
+                "lora_plus_fast_group_params": 0.0,
+            },
+        )
+
+    base_group: List[torch.nn.Parameter] = []
+    fast_group: List[torch.nn.Parameter] = []
+    for name, param in named_trainable:
+        if _is_lora_b_parameter(name):
+            fast_group.append(param)
+        else:
+            base_group.append(param)
+
+    if not fast_group:
+        return (
+            [{"params": [param for _name, param in named_trainable], "lr": base_lr, "weight_decay": weight_decay}],
+            {
+                "trainable_params": float(len(named_trainable)),
+                "lora_plus_ratio": 0.0,
+                "lora_plus_base_group_params": float(len(named_trainable)),
+                "lora_plus_fast_group_params": 0.0,
+            },
+        )
+
+    groups: List[Dict[str, object]] = []
+    if base_group:
+        groups.append({"params": base_group, "lr": base_lr, "weight_decay": weight_decay})
+    groups.append({"params": fast_group, "lr": base_lr * ratio, "weight_decay": weight_decay})
+    return (
+        groups,
+        {
+            "trainable_params": float(len(named_trainable)),
+            "lora_plus_ratio": float(ratio),
+            "lora_plus_base_group_params": float(len(base_group)),
+            "lora_plus_fast_group_params": float(len(fast_group)),
+        },
+    )
+
+
 def _load_init_adapter_config(adapter_dir: Path) -> Dict[str, object]:
     cfg_path = adapter_dir / "adapter_config.json"
     if not cfg_path.exists():
@@ -1175,13 +1479,15 @@ def _build_lr_lambda(
     warmup_steps: int,
     total_steps: int,
     min_lr_ratio: float,
+    restart_period: int = 0,
 ):
     schedule_mode = str(schedule).strip().lower()
-    if schedule_mode not in {"constant", "cosine"}:
+    if schedule_mode not in {"constant", "cosine", "cosine_restarts"}:
         schedule_mode = "constant"
     warmup = max(0, int(warmup_steps))
     total = max(1, int(total_steps))
     min_ratio = max(0.0, min(1.0, float(min_lr_ratio)))
+    period = max(0, int(restart_period))
 
     def _lambda(step_idx: int) -> float:
         step = int(step_idx) + 1
@@ -1189,7 +1495,13 @@ def _build_lr_lambda(
             return max(1e-6, float(step) / float(max(1, warmup)))
         if schedule_mode == "constant" or total <= warmup:
             return 1.0
-        progress = float(step - warmup) / float(max(1, total - warmup))
+        post_warmup = step - warmup
+        if schedule_mode == "cosine_restarts" and period > 0:
+            # Cosine annealing with periodic warm restarts.
+            cycle_pos = post_warmup % period
+            progress = float(cycle_pos) / float(max(1, period))
+        else:
+            progress = float(post_warmup) / float(max(1, total - warmup))
         progress = max(0.0, min(1.0, progress))
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return float(min_ratio + (1.0 - min_ratio) * cosine)
@@ -1215,6 +1527,12 @@ def _register_neftune_hook(model, noise_alpha: float):
         return output + noise
 
     return emb.register_forward_hook(_hook)
+
+
+def _replace_neftune_hook(model, hook, noise_alpha: float):
+    if hook is not None:
+        hook.remove()
+    return _register_neftune_hook(model, noise_alpha=float(noise_alpha))
 
 
 def _load_adapter_state_dict(adapter_dir: Path) -> Dict[str, torch.Tensor]:
@@ -1315,8 +1633,119 @@ def build_preference_rows(
         rejected = _encode_user_assistant(tokenizer, pair.user, pair.rejected, max_length=max_length)
         if chosen is None or rejected is None:
             continue
-        rows.append({"chosen": chosen, "rejected": rejected, "weight": float(max(0.1, pair.weight))})
+        rows.append(
+            {
+                "chosen": chosen,
+                "rejected": rejected,
+                "weight": float(max(0.1, pair.weight)),
+                "base_weight": float(max(0.1, pair.weight)),
+                "quality_gap": float(max(0.0, pair.quality_gap)),
+                "rejected_similarity": float(max(0.0, min(1.0, pair.rejected_similarity))),
+                "prompt_complexity": float(max(0.0, pair.prompt_complexity)),
+                "selection_score": float(max(0.0, pair.selection_score)),
+                "conversation_score": float(max(0.0, pair.conversation_score)),
+                "reasoning_score": float(max(0.0, pair.reasoning_score)),
+                "creativity_score": float(max(0.0, pair.creativity_score)),
+                "is_followup": bool(pair.is_followup),
+            }
+        )
     return rows
+
+
+def _preference_row_rescore_weight(
+    row: Dict[str, object],
+    progress: float,
+    target_hardness: float,
+    hardness_bandwidth: float,
+) -> float:
+    base_weight = max(0.1, float(row.get("base_weight", row.get("weight", 1.0))))
+    quality_gap = max(0.0, float(row.get("quality_gap", 0.0)))
+    rejected_similarity = max(0.0, min(1.0, float(row.get("rejected_similarity", 0.0))))
+    prompt_complexity = max(0.0, float(row.get("prompt_complexity", 0.0)))
+    selection_score = max(0.0, float(row.get("selection_score", 0.0)))
+    conversation_score = max(0.0, float(row.get("conversation_score", 0.0)))
+    reasoning_score = max(0.0, float(row.get("reasoning_score", 0.0)))
+    creativity_score = max(0.0, float(row.get("creativity_score", 0.0)))
+    followup_bonus = 0.04 if bool(row.get("is_followup", False)) else 0.0
+
+    easy_focus = 0.84 + 0.46 * min(1.0, quality_gap / 0.24)
+    z = (rejected_similarity - target_hardness) / max(0.05, hardness_bandwidth)
+    hardness_window = math.exp(-0.5 * z * z)
+    hard_focus = 0.78 + 0.58 * hardness_window
+    difficulty_focus = ((1.0 - progress) * easy_focus) + (progress * hard_focus)
+
+    novelty_focus = (
+        1.0
+        + 0.05 * min(2.0, conversation_score)
+        + 0.07 * min(2.0, reasoning_score)
+        + 0.04 * min(2.0, creativity_score)
+        + followup_bonus
+    )
+    prompt_focus = 0.96 + 0.04 * min(2.5, prompt_complexity)
+    selection_focus = 1.0 + 0.03 * min(4.0, selection_score)
+    raw_weight = base_weight * difficulty_focus * novelty_focus * prompt_focus * selection_focus
+    return float(max(0.1, raw_weight))
+
+
+def _rescore_preference_rows(
+    pref_rows: List[Dict[str, object]],
+    step: int,
+    total_steps: int,
+    round_index: int,
+) -> Dict[str, float]:
+    if not pref_rows:
+        return {
+            "weight_mean": 0.0,
+            "weight_min": 0.0,
+            "weight_max": 0.0,
+            "progress": 0.0,
+            "target_hardness": 0.0,
+            "hardness_bandwidth": 0.0,
+        }
+
+    progress = max(0.0, min(1.0, float(step) / float(max(1, total_steps))))
+    target_hardness = 0.18 + 0.50 * progress
+    hardness_bandwidth = 0.28 - 0.10 * progress
+
+    base_weights = [max(0.1, float(row.get("base_weight", row.get("weight", 1.0)))) for row in pref_rows]
+    raw_weights = [
+        _preference_row_rescore_weight(
+            row=row,
+            progress=progress,
+            target_hardness=target_hardness,
+            hardness_bandwidth=hardness_bandwidth,
+        )
+        for row in pref_rows
+    ]
+
+    target_mean = float(sum(base_weights) / max(1, len(base_weights)))
+    raw_mean = float(sum(raw_weights) / max(1, len(raw_weights)))
+    scale = target_mean / max(1e-6, raw_mean)
+
+    final_weights: List[float] = []
+    for row, raw_weight in zip(pref_rows, raw_weights):
+        updated_weight = float(max(0.1, min(4.5, raw_weight * scale)))
+        row["weight"] = updated_weight
+        final_weights.append(updated_weight)
+
+    summary = {
+        "weight_mean": float(sum(final_weights) / max(1, len(final_weights))),
+        "weight_min": float(min(final_weights)),
+        "weight_max": float(max(final_weights)),
+        "progress": float(progress),
+        "target_hardness": float(target_hardness),
+        "hardness_bandwidth": float(hardness_bandwidth),
+    }
+    print(
+        "[pref] rescored rows: "
+        f"round={int(round_index)} step={int(step)}/{int(max(1, total_steps))} "
+        f"progress={summary['progress']:.3f} "
+        f"target_hardness={summary['target_hardness']:.3f} "
+        f"bandwidth={summary['hardness_bandwidth']:.3f} "
+        f"weight_mean={summary['weight_mean']:.3f} "
+        f"range=[{summary['weight_min']:.3f}, {summary['weight_max']:.3f}]"
+    )
+    return summary
 
 
 def collate_preference_rows(
@@ -1361,6 +1790,48 @@ def _sequence_average_log_prob(logits: torch.Tensor, labels: torch.Tensor) -> Tu
     return avg_log_prob, lengths
 
 
+def _weighted_mean(values: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+    if weights is None:
+        return values.mean()
+    norm_w = weights.float() / weights.float().mean().clamp_min(1e-6)
+    return (values * norm_w).sum() / norm_w.sum().clamp_min(1e-6)
+
+
+def _symmetric_token_kl(logits_a: torch.Tensor, logits_b: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    shift_labels = labels[:, 1:]
+    valid = shift_labels.ne(-100)
+    if not bool(valid.any()):
+        return logits_a.new_zeros((labels.shape[0],))
+
+    shift_logits_a = logits_a[:, :-1, :]
+    shift_logits_b = logits_b[:, :-1, :]
+    logp_a = torch.log_softmax(shift_logits_a, dim=-1)
+    logp_b = torch.log_softmax(shift_logits_b, dim=-1)
+    kl_ab = torch.nn.functional.kl_div(logp_b, logp_a, reduction="none", log_target=True).sum(dim=-1)
+    kl_ba = torch.nn.functional.kl_div(logp_a, logp_b, reduction="none", log_target=True).sum(dim=-1)
+    sym = 0.5 * (kl_ab + kl_ba)
+    sym = sym * valid.to(sym.dtype)
+    lengths = valid.sum(dim=1).clamp_min(1)
+    return sym.sum(dim=1) / lengths
+
+
+def _wpo_pair_weights(
+    chosen_logp: torch.Tensor,
+    rejected_logp: torch.Tensor,
+    alpha: float,
+    clip: float,
+) -> torch.Tensor:
+    if alpha <= 0.0:
+        return torch.ones_like(chosen_logp)
+
+    pair_log_weight = chosen_logp.detach().float() + rejected_logp.detach().float()
+    pair_log_weight = pair_log_weight - pair_log_weight.mean()
+    weights = torch.exp(float(alpha) * pair_log_weight)
+    max_scale = max(1.0, float(clip))
+    weights = weights.clamp(min=1.0 / max_scale, max=max_scale)
+    return weights / weights.mean().clamp_min(1e-6)
+
+
 def _log_odds_from_avg_log_prob(avg_log_prob: torch.Tensor) -> torch.Tensor:
     # ORPO-style odds ratio needs sequence probabilities in (0, 1).
     safe_log_prob = avg_log_prob.clamp(min=math.log(1e-8), max=math.log(1.0 - 1e-6))
@@ -1373,6 +1844,105 @@ def _linear_schedule_value(start: float, end: float, step_idx: int, total_steps:
         return float(start)
     t = float(max(0, min(step_idx, total_steps - 1))) / float(total_steps - 1)
     return float(start + (end - start) * t)
+
+
+def _sigmoid_preference_loss(logits_delta: torch.Tensor, label_smoothing: float = 0.0) -> torch.Tensor:
+    eps = max(0.0, min(0.49, float(label_smoothing)))
+    pos = torch.nn.functional.logsigmoid(logits_delta)
+    if eps <= 0.0:
+        return -pos
+    neg = torch.nn.functional.logsigmoid(-logits_delta)
+    return -((1.0 - eps) * pos + eps * neg)
+
+
+def _dpo_preference_loss(
+    delta: torch.Tensor,
+    ref_delta: torch.Tensor,
+    beta: float,
+    margin: float = 0.0,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    logits_delta = float(beta) * ((delta - ref_delta) - float(margin))
+    return _sigmoid_preference_loss(logits_delta, label_smoothing=label_smoothing)
+
+
+def _ipo_target_gap(beta: float, margin: float = 0.0) -> float:
+    return float(margin) + 0.5 / max(1e-6, float(beta))
+
+
+def _ipo_preference_loss(
+    delta: torch.Tensor,
+    ref_delta: torch.Tensor,
+    beta: float,
+    margin: float = 0.0,
+) -> torch.Tensor:
+    target_gap = _ipo_target_gap(beta=beta, margin=margin)
+    return ((delta - ref_delta) - float(target_gap)).pow(2)
+
+
+def _xpo_preference_logits_delta(
+    chosen_logp: torch.Tensor,
+    rejected_logp: torch.Tensor,
+    ref_chosen_logp: torch.Tensor,
+    ref_rejected_logp: torch.Tensor,
+    beta: float,
+    clip: float = 0.0,
+) -> torch.Tensor:
+    chosen_log_ratio = chosen_logp - ref_chosen_logp
+    rejected_log_ratio = rejected_logp - ref_rejected_logp
+    logits_delta = float(beta) * (
+        _xpo_log_ratio_transform(chosen_log_ratio) - _xpo_log_ratio_transform(rejected_log_ratio)
+    )
+    if float(clip) > 0.0:
+        logits_delta = logits_delta.clamp(min=-float(clip), max=float(clip))
+    return logits_delta
+
+
+def _xpo_log_ratio_transform(log_ratio: torch.Tensor) -> torch.Tensor:
+    return torch.exp(log_ratio) + log_ratio
+
+
+def _xpo_preference_loss(
+    chosen_logp: torch.Tensor,
+    rejected_logp: torch.Tensor,
+    ref_chosen_logp: torch.Tensor,
+    ref_rejected_logp: torch.Tensor,
+    beta: float,
+    clip: float = 0.0,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    logits_delta = _xpo_preference_logits_delta(
+        chosen_logp=chosen_logp,
+        rejected_logp=rejected_logp,
+        ref_chosen_logp=ref_chosen_logp,
+        ref_rejected_logp=ref_rejected_logp,
+        beta=beta,
+        clip=clip,
+    )
+    return _sigmoid_preference_loss(logits_delta, label_smoothing=label_smoothing)
+
+
+def _robust_preference_correctness_weights(
+    logits_delta: torch.Tensor,
+    alpha: float,
+    noise_eta: float,
+    clip: float,
+) -> torch.Tensor:
+    robust_alpha = max(0.0, min(1.0, float(alpha)))
+    eta = max(0.0, min(0.49, float(noise_eta)))
+    if robust_alpha <= 0.0 or eta <= 0.0:
+        return torch.ones_like(logits_delta)
+
+    prob_correct = torch.sigmoid(logits_delta.detach().float())
+    numerator = (1.0 - eta) * prob_correct
+    denom = numerator + eta * (1.0 - prob_correct)
+    posterior = numerator / denom.clamp_min(1e-6)
+    weights = posterior / posterior.mean().clamp_min(1e-6)
+    max_scale = max(1.0, float(clip))
+    weights = weights.clamp(min=1.0 / max_scale, max=max_scale)
+    weights = weights / weights.mean().clamp_min(1e-6)
+    blended = (1.0 - robust_alpha) + robust_alpha * weights
+    return blended / blended.mean().clamp_min(1e-6)
 
 
 def _pair_sft_weight(
@@ -1437,20 +2007,26 @@ def filter_sft_training_pairs(
     min_quality_score: float,
     keep_short_answer_prompts: bool,
     exempt_sources: Optional[Sequence[str]] = None,
+    drop_synthetic_prompts: bool = False,
     min_keep_pairs: int = 32,
 ) -> List[ChatPair]:
     threshold = float(min_quality_score)
     exempt = {str(x or "").strip().lower() for x in (exempt_sources or []) if str(x or "").strip()}
     if threshold <= -1e8:
-        return list(pairs)
+        if not bool(drop_synthetic_prompts):
+            return list(pairs)
 
     kept: List[ChatPair] = []
     dropped_quality = 0
     dropped_short = 0
+    dropped_synthetic = 0
     for pair in pairs:
         src_low = str(pair.source or "").strip().lower()
         if src_low in exempt:
             kept.append(pair)
+            continue
+        if bool(drop_synthetic_prompts) and _is_synthetic_template_prompt(pair.user):
+            dropped_synthetic += 1
             continue
         if bool(keep_short_answer_prompts) and _is_short_answer_prompt(pair.user):
             kept.append(pair)
@@ -1473,7 +2049,53 @@ def filter_sft_training_pairs(
     print(
         "[sft] quality filter: "
         f"threshold={threshold:.2f} kept={len(kept)} dropped_quality={dropped_quality} "
-        f"dropped_short={dropped_short} exempt_sources={len(exempt)}"
+        f"dropped_short={dropped_short} dropped_synthetic={dropped_synthetic} "
+        f"exempt_sources={len(exempt)}"
+    )
+    return kept
+
+
+def filter_eval_pairs(
+    pairs: Sequence[ChatPair],
+    min_quality_score: float,
+    drop_synthetic_prompts: bool,
+    min_keep_pairs: int = 64,
+) -> List[ChatPair]:
+    threshold = float(min_quality_score)
+    if threshold <= -1e8 and not bool(drop_synthetic_prompts):
+        return list(pairs)
+
+    kept: List[ChatPair] = []
+    non_synthetic_ranked: List[Tuple[float, ChatPair]] = []
+    dropped_quality = 0
+    dropped_synthetic = 0
+    for pair in pairs:
+        if bool(drop_synthetic_prompts) and _is_synthetic_template_prompt(pair.user):
+            dropped_synthetic += 1
+            continue
+        paired_score, _alignment = _paired_response_score(pair.user, pair.assistant)
+        non_synthetic_ranked.append((paired_score, pair))
+        if threshold > -1e8 and paired_score < threshold:
+            dropped_quality += 1
+            continue
+        kept.append(pair)
+
+    if len(kept) < max(8, int(min_keep_pairs)) and non_synthetic_ranked:
+        target_keep = min(len(non_synthetic_ranked), max(8, int(min_keep_pairs)))
+        non_synthetic_ranked.sort(key=lambda x: x[0], reverse=True)
+        kept = [pair for _score, pair in non_synthetic_ranked[:target_keep]]
+        print(
+            "[eval] quality filter fallback: "
+            f"kept={len(kept)} after ranking top non-synthetic pairs "
+            f"(threshold={threshold:.2f}, dropped_quality={dropped_quality}, "
+            f"dropped_synthetic={dropped_synthetic})"
+        )
+        return kept
+
+    print(
+        "[eval] quality filter: "
+        f"threshold={threshold:.2f} kept={len(kept)} dropped_quality={dropped_quality} "
+        f"dropped_synthetic={dropped_synthetic}"
     )
     return kept
 
@@ -1548,6 +2170,44 @@ def _significant_token_set(text: str, max_tokens: int = 96) -> set:
     return out
 
 
+def _prompt_ambiguity_profile(latest_user: str, has_anchor: bool) -> Dict[str, bool]:
+    text = _normalize_whitespace(_coerce_text(latest_user))
+    low = text.lower()
+    content_terms = _significant_token_set(text, max_tokens=24)
+    explicit_target = bool(
+        EXPLICIT_TARGET_RE.search(text)
+        or "`" in text
+        or "\n" in text
+        or (":" in text and len(text) >= 20)
+    )
+    short_query = len(content_terms) <= 2 and len(text.split()) <= 5
+    vague_followup = bool(FOLLOWUP_HINT_RE.search(low)) and len(content_terms) <= 4
+    generic_edit = bool(AMBIGUOUS_EDIT_RE.search(low))
+    conflict = bool(SHORTEN_HINT_RE.search(low) and EXPAND_HINT_RE.search(low))
+    missing_anchor = (not bool(has_anchor)) and (generic_edit or vague_followup or short_query)
+    ambiguous = bool(conflict or (missing_anchor and not explicit_target))
+    return {
+        "ambiguous": ambiguous,
+        "missing_anchor": missing_anchor,
+        "conflict": conflict,
+        "generic_edit": generic_edit,
+    }
+
+
+def _clarification_response_signal(text: str) -> float:
+    low = _fast_cleanup_response_text(text).lower()
+    if not low:
+        return 0.0
+    score = 0.0
+    if "?" in low:
+        score += 0.35
+    if CLARIFICATION_RESPONSE_RE.search(low):
+        score += 0.45
+    if re.search(r"\b(paste|share|point me to|tell me which|show me)\b", low):
+        score += 0.15
+    return float(min(1.0, score))
+
+
 def _response_reasoning_signal(text: str) -> float:
     low = _fast_cleanup_response_text(text).lower()
     if not low:
@@ -1608,6 +2268,9 @@ def _response_quality_score(text: str) -> float:
         score -= 2.0
     if "[[" in t or "]]" in t:
         score -= 1.0
+    artifact_hits = _synthetic_artifact_hits(t)
+    if artifact_hits > 0:
+        score -= min(2.4, 0.9 * float(artifact_hits))
 
     low = t.lower()
     for bad in ("assistant:", "user:", "as an ai", "i cannot", "i'm unable"):
@@ -1651,48 +2314,76 @@ def _response_alignment_metrics(user_text: str, assistant_text: str) -> PairAlig
     rewrite = bool(REWRITE_HINT_RE.search(latest_low))
     wants_creative = bool(CREATIVE_REQUEST_RE.search(latest_low))
     wants_reasoning = bool(REASONING_REQUEST_RE.search(latest_low) or _looks_like_reasoning_prompt(latest_user))
+    ambiguity = _prompt_ambiguity_profile(latest_user, has_anchor=bool(last_assistant))
+    clarification = _clarification_response_signal(response) if ambiguity["ambiguous"] else 0.0
 
     conversation = 0.55 * coverage + 0.18 * number_coverage
     reasoning = _response_reasoning_signal(response) if wants_reasoning else 0.0
     creativity = _response_creativity_signal(response) if wants_creative else 0.0
+    constraint = 0.0
 
     if followup and last_assistant:
         prev_tokens = _significant_token_set(last_assistant)
         prev_overlap = 0.0
         if prev_tokens:
             prev_overlap = float(len(prev_tokens & response_tokens)) / float(max(1, len(prev_tokens)))
+        prev_numbers = set(NUMBER_RE.findall(last_assistant))
+        prev_number_overlap = 0.0
+        if prev_numbers:
+            prev_number_overlap = float(len(prev_numbers & response_numbers)) / float(max(1, len(prev_numbers)))
         prev_word_count = max(1, _word_token_count(last_assistant))
         resp_word_count = max(1, _word_token_count(response))
         len_ratio = float(resp_word_count) / float(prev_word_count)
         conversation += 0.18 * min(1.0, prev_overlap / 0.45)
+        constraint += 0.22 * min(1.0, prev_overlap / 0.45) + 0.10 * prev_number_overlap
         if shorten:
             if len_ratio < 0.90:
-                conversation += 0.28 * min(1.0, (0.90 - len_ratio) / 0.55)
+                shorten_gain = 0.28 * min(1.0, (0.90 - len_ratio) / 0.55)
+                conversation += shorten_gain
+                constraint += shorten_gain
             else:
-                conversation -= 0.10 * min(1.0, (len_ratio - 0.90) / 0.80)
+                shorten_penalty = 0.10 * min(1.0, (len_ratio - 0.90) / 0.80)
+                conversation -= shorten_penalty
+                constraint -= shorten_penalty
         elif expand:
             if len_ratio > 1.05:
-                conversation += 0.24 * min(1.0, (len_ratio - 1.05) / 1.10)
+                expand_gain = 0.24 * min(1.0, (len_ratio - 1.05) / 1.10)
+                conversation += expand_gain
+                constraint += expand_gain
             conversation += 0.18 * reasoning
+            constraint += 0.14 * reasoning
         elif rewrite:
             sim = float(SequenceMatcher(None, last_assistant.lower(), response.lower()).ratio())
             if 0.18 <= sim <= 0.94:
                 conversation += 0.18
+                constraint += 0.18
             elif sim > 0.98:
                 conversation -= 0.10
+                constraint -= 0.10
         elif wants_creative:
             conversation += 0.16 * creativity
+            constraint += 0.12 * creativity
+        if wants_reasoning:
+            constraint += 0.12 * reasoning
 
     if wants_reasoning:
         conversation += 0.12 * reasoning
     if wants_creative:
         conversation += 0.10 * creativity
+    if ambiguity["ambiguous"]:
+        conversation += 0.22 * clarification
+        if clarification < 0.12 and coverage < 0.08:
+            conversation -= 0.16
+    constraint = float(max(-0.30, min(1.40, constraint)))
 
     conversation = float(max(-0.30, min(1.60, conversation)))
     return PairAlignmentMetrics(
         conversation=conversation,
         reasoning=float(max(0.0, min(1.0, reasoning))),
         creativity=float(max(0.0, min(1.0, creativity))),
+        clarification=float(max(0.0, min(1.0, clarification))),
+        constraint=float(max(0.0, min(1.0, constraint))),
+        is_ambiguous=bool(ambiguity["ambiguous"]),
         is_followup=bool(followup),
     )
 
@@ -1703,6 +2394,9 @@ def _paired_response_score(user_text: str, assistant_text: str) -> Tuple[float, 
     score += 0.32 * float(alignment.conversation)
     score += 0.18 * float(alignment.reasoning)
     score += 0.16 * float(alignment.creativity)
+    score += 0.14 * float(alignment.constraint)
+    if alignment.is_ambiguous:
+        score += 0.18 * float(alignment.clarification)
     if alignment.is_followup:
         score += 0.06 * max(0.0, float(alignment.conversation))
     return float(score), alignment
@@ -2329,7 +3023,10 @@ def finetune_qwen(
     base_model: str,
     train_pairs: Sequence[ChatPair],
     output_dir: Path,
-    device: torch.device,
+    device: Any,
+    runtime_device_requested: str,
+    runtime_device_resolved: str,
+    runtime_device_preference: str,
     model_dtype: torch.dtype,
     gradient_checkpointing: bool,
     max_length: int,
@@ -2351,7 +3048,9 @@ def finetune_qwen(
     use_dora: bool,
     use_rslora: bool,
     lora_init: str,
+    lora_plus_ratio: float,
     neftune_noise_alpha: float,
+    preference_neftune_noise_alpha: float,
     sft_weight_mode: str,
     sft_min_weight: float,
     sft_max_weight: float,
@@ -2364,12 +3063,23 @@ def finetune_qwen(
     sft_prompt_skill_boost: float,
     sft_conversation_boost: float,
     sft_creativity_boost: float,
+    sft_followup_paraphrase_aug: int,
+    sft_followup_paraphrase_weight: float,
+    sft_rdrop_alpha: float,
     sft_min_quality_score: float,
     sft_filter_keep_short_answers: bool,
+    sft_drop_synthetic_prompts: bool,
     sft_quality_filter_exempt_sources: Optional[Sequence[str]],
     sft_auto_balance_sources: bool,
     sft_source_balance_strength: float,
     sft_source_balance_max_scale: float,
+    sft_lr_restart_period: int,
+    sft_focal_gamma: float,
+    sft_eval_every_steps: int,
+    sft_early_stop_patience: int,
+    sft_curriculum_quality_ramp: float,
+    sft_grad_noise_eta: float,
+    eval_pairs: Sequence[ChatPair],
     preference_objective: str,
     preference_steps: int,
     preference_pairs: int,
@@ -2377,9 +3087,16 @@ def finetune_qwen(
     preference_beta_end: float,
     preference_margin: float,
     preference_margin_end: float,
+    preference_label_smoothing: float,
+    preference_xpo_clip: float,
     preference_sft_weight: float,
     preference_length_weight: float,
     preference_hardness_gamma: float,
+    preference_robust_alpha: float,
+    preference_robust_eta: float,
+    preference_robust_clip: float,
+    preference_wpo_alpha: float,
+    preference_wpo_clip: float,
     preference_reference_anchor_weight: float,
     preference_reference_anchor_batch_size: int,
     preference_lr: float,
@@ -2416,15 +3133,24 @@ def finetune_qwen(
     preference_selection_hardness_bandwidth: float,
     seed: int,
     save_every_steps: int,
+    preference_rescore_every: int,
     skip_sft: bool,
     init_adapter_match_lora: bool,
     init_adapter_dir: Optional[str] = None,
+    resume_sft_steps: int = 0,
+    resume_preference_steps: int = 0,
+    resume_sft_loss_mean: float = 0.0,
+    resume_preference_loss_mean: float = 0.0,
 ) -> Tuple[Path, Dict[str, float]]:
     random.seed(seed)
     torch.manual_seed(seed)
-    if device.type == "cpu" and bool(gradient_checkpointing):
+    runtime_backend = _device_backend_name(device=device, resolved_backend=runtime_device_resolved)
+    if runtime_backend == "cpu" and bool(gradient_checkpointing):
         print("[train] gradient checkpointing disabled on cpu (stability + no memory benefit).")
         gradient_checkpointing = False
+    if runtime_backend == "cpu" and float(sft_rdrop_alpha) > 0.0:
+        print("[train] R-Drop disabled on cpu (it doubles forward cost and makes progress look stalled).")
+        sft_rdrop_alpha = 0.0
 
     init_path: Optional[Path] = None
     if init_adapter_dir:
@@ -2439,8 +3165,12 @@ def finetune_qwen(
     )
     print(
         "[train] runtime config: "
-        f"device={device.type} model_dtype={str(model_dtype)} "
-        f"gradient_checkpointing={bool(gradient_checkpointing)}"
+        f"requested={runtime_device_requested} resolved={runtime_backend} "
+        f"device={device} model_dtype={str(model_dtype)} "
+        f"gradient_checkpointing={bool(gradient_checkpointing)} "
+        f"torch_threads={torch.get_num_threads()} "
+        f"interop_threads={torch.get_num_interop_threads()} "
+        f"preference={runtime_device_preference}"
     )
     target_modules = _target_modules_from_arg(lora_targets)
     if bool(init_adapter_match_lora) and init_path is not None and init_path.exists():
@@ -2508,6 +3238,11 @@ def finetune_qwen(
     print("[train] stage=prepare_train_mode start")
     model.train()
     noise_hook = _register_neftune_hook(model, noise_alpha=float(neftune_noise_alpha))
+    print(
+        "[train] NEFTune config: "
+        f"sft_noise_alpha={float(neftune_noise_alpha):.3f} "
+        f"preference_noise_alpha={float(preference_neftune_noise_alpha):.3f}"
+    )
     print("[train] stage=prepare_train_mode done")
 
     print("[train] stage=filter_sft_pairs start")
@@ -2515,6 +3250,7 @@ def finetune_qwen(
         train_pairs,
         min_quality_score=float(sft_min_quality_score),
         keep_short_answer_prompts=bool(sft_filter_keep_short_answers),
+        drop_synthetic_prompts=bool(sft_drop_synthetic_prompts),
         exempt_sources=sft_quality_filter_exempt_sources,
     )
     print("[train] stage=filter_sft_pairs done")
@@ -2557,6 +3293,8 @@ def finetune_qwen(
                 * float(source_balance_factors.get(str(p.source or "dataset"), 1.0)),
             ),
         ),
+        followup_paraphrase_aug=int(sft_followup_paraphrase_aug),
+        followup_paraphrase_weight=float(sft_followup_paraphrase_weight),
     )
     dataset = PackedChatDataset(train_rows)
     loader = DataLoader(
@@ -2566,13 +3304,25 @@ def finetune_qwen(
         collate_fn=lambda b: collate_rows(b, tokenizer.pad_token_id),
     )
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optim = torch.optim.AdamW(
-        trainable_params,
-        lr=float(lr),
+    optim_groups, lora_plus_stats = _build_optimizer_param_groups(
+        model=model,
+        base_lr=float(lr),
         weight_decay=float(weight_decay),
+        lora_plus_ratio=float(lora_plus_ratio),
     )
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optim = torch.optim.AdamW(optim_groups)
+    if float(lora_plus_stats.get("lora_plus_ratio", 0.0)) > 0.0:
+        print(
+            "[train] LoRA+ optimizer groups: "
+            f"ratio={lora_plus_stats['lora_plus_ratio']:.2f} "
+            f"base_group={int(lora_plus_stats['lora_plus_base_group_params'])} "
+            f"fast_group={int(lora_plus_stats['lora_plus_fast_group_params'])}"
+        )
     sft_total_steps = max(1, int(max_steps))
+    resume_sft_steps = max(0, min(int(resume_sft_steps), sft_total_steps))
+    for group in optim.param_groups:
+        group.setdefault("initial_lr", group["lr"])
     sft_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optim,
         lr_lambda=_build_lr_lambda(
@@ -2580,18 +3330,59 @@ def finetune_qwen(
             warmup_steps=int(sft_warmup_steps),
             total_steps=sft_total_steps,
             min_lr_ratio=float(sft_min_lr_ratio),
+            restart_period=int(sft_lr_restart_period),
         ),
+        last_epoch=resume_sft_steps - 1,
     )
+    # -- v28 improvements config --
+    focal_gamma = max(0.0, float(sft_focal_gamma))
+    eval_every = max(0, int(sft_eval_every_steps))
+    early_stop_patience = max(0, int(sft_early_stop_patience))
+    curriculum_ramp = max(0.0, float(sft_curriculum_quality_ramp))
+    grad_noise_eta = max(0.0, float(sft_grad_noise_eta))
+    pref_rescore_every = max(0, int(preference_rescore_every))
+    if focal_gamma > 0 or eval_every > 0 or curriculum_ramp > 0 or grad_noise_eta > 0:
+        print(
+            "[train] v28 improvements: "
+            f"focal_gamma={focal_gamma:.2f} eval_every={eval_every} "
+            f"early_stop_patience={early_stop_patience} "
+            f"curriculum_ramp={curriculum_ramp:.3f} "
+            f"grad_noise_eta={grad_noise_eta:.4f} "
+            f"lr_restart_period={int(sft_lr_restart_period)} "
+            f"pref_rescore_every={pref_rescore_every}"
+        )
+    # Build eval set for validation monitoring
+    eval_loader = None
+    if eval_every > 0 and eval_pairs:
+        eval_rows = build_rows(tokenizer, list(eval_pairs), max_length=max_length)
+        if eval_rows:
+            eval_dataset = PackedChatDataset(eval_rows)
+            eval_loader = DataLoader(
+                eval_dataset,
+                batch_size=max(1, int(batch_size)),
+                shuffle=False,
+                collate_fn=lambda b: collate_rows(b, tokenizer.pad_token_id),
+            )
+            print(f"[train] eval monitoring: {len(eval_rows)} eval samples, check every {eval_every} steps")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_every = max(0, int(save_every_steps))
-    steps = 0
+    steps = resume_sft_steps
     token_count = 0
     sft_weight_accum = 0.0
     sft_weight_count = 0
-    sft_loss_sum = 0.0
+    sft_loss_sum = float(resume_sft_loss_mean) * float(steps)
+    sft_rdrop_sum = 0.0
+    best_eval_loss = float('inf')
+    eval_no_improve_count = 0
+    sft_early_stopped = False
     t0 = time.time()
     optim.zero_grad(set_to_none=True)
+    if steps > 0:
+        print(
+            "[resume] continuing SFT from adapter "
+            f"{init_path} at step={steps} (optimizer state is reinitialized)"
+        )
 
     if bool(skip_sft):
         print("[train] skipping SFT stage (--skip_sft).")
@@ -2606,6 +3397,16 @@ def finetune_qwen(
                 sample_weights = batch.get("weights")
                 if sample_weights is not None:
                     sample_weights = sample_weights.to(device).float()
+                    # Curriculum quality ramp: linearly reduce weight of lower-quality
+                    # samples over the first 50% of training by modulating weights.
+                    if curriculum_ramp > 0.0 and steps < sft_total_steps // 2:
+                        # Ramp progress goes 0 -> 1 over first half of training.
+                        ramp_progress = float(steps) / float(max(1, sft_total_steps // 2))
+                        # Scale: weights below median get reduced early, restored later.
+                        ramp_scale = 1.0 - curriculum_ramp * (1.0 - ramp_progress)
+                        weight_median = sample_weights.median()
+                        below_median = (sample_weights < weight_median).float()
+                        sample_weights = sample_weights * (1.0 - below_median * (1.0 - ramp_scale))
                     sft_weight_accum += float(sample_weights.sum().item())
                     sft_weight_count += int(sample_weights.numel())
 
@@ -2615,11 +3416,33 @@ def finetune_qwen(
                 )
                 seq_logp, _ = _sequence_average_log_prob(out.logits, model_batch["labels"])
                 seq_loss = -seq_logp
-                if sample_weights is not None:
-                    norm_w = sample_weights / sample_weights.mean().clamp_min(1e-6)
-                    loss_value = (seq_loss * norm_w).sum() / norm_w.sum().clamp_min(1e-6)
-                else:
-                    loss_value = seq_loss.mean()
+
+                # Focal loss: down-weight easy samples, up-weight hard ones.
+                if focal_gamma > 0.0:
+                    focal_weight = (1.0 - torch.exp(-seq_loss.detach())).pow(focal_gamma)
+                    if sample_weights is not None:
+                        sample_weights = sample_weights * focal_weight
+                    else:
+                        sample_weights = focal_weight
+
+                loss_value = _weighted_mean(seq_loss, sample_weights)
+
+                rdrop_value = seq_loss.new_zeros(())
+                if float(sft_rdrop_alpha) > 0.0:
+                    out_b = model(
+                        input_ids=model_batch["input_ids"],
+                        attention_mask=model_batch["attention_mask"],
+                    )
+                    seq_logp_b, _ = _sequence_average_log_prob(out_b.logits, model_batch["labels"])
+                    seq_loss_b = -seq_logp_b
+                    base_loss = 0.5 * (
+                        _weighted_mean(seq_loss, sample_weights)
+                        + _weighted_mean(seq_loss_b, sample_weights)
+                    )
+                    rdrop_term = _symmetric_token_kl(out.logits, out_b.logits, model_batch["labels"])
+                    rdrop_value = _weighted_mean(rdrop_term, sample_weights)
+                    loss_value = base_loss + float(sft_rdrop_alpha) * rdrop_value
+                    sft_rdrop_sum += float(rdrop_value.item())
                 loss = loss_value / max(1, int(grad_accum_steps))
                 loss.backward()
 
@@ -2630,6 +3453,12 @@ def finetune_qwen(
                 if (i + 1) % max(1, int(grad_accum_steps)) == 0:
                     if float(sft_max_grad_norm) > 0:
                         torch.nn.utils.clip_grad_norm_(trainable_params, float(sft_max_grad_norm))
+                    # Gradient noise injection for escaping sharp minima.
+                    if grad_noise_eta > 0.0:
+                        noise_std = grad_noise_eta / (1.0 + float(steps)) ** 0.55
+                        for p in trainable_params:
+                            if p.grad is not None:
+                                p.grad.add_(torch.randn_like(p.grad) * noise_std)
                     optim.step()
                     sft_scheduler.step()
                     optim.zero_grad(set_to_none=True)
@@ -2638,7 +3467,7 @@ def finetune_qwen(
                         current_lr = float(optim.param_groups[0]["lr"])
                         print(
                             f"[train] step={steps} loss={sft_loss_sum / max(1, steps):.4f} "
-                            f"lr={current_lr:.6g}"
+                            f"lr={current_lr:.6g} rdrop={sft_rdrop_sum / max(1, steps):.4f}"
                         )
                     if checkpoint_every > 0 and steps % checkpoint_every == 0:
                         ckpt_adapter_dir = output_dir / "checkpoints" / f"sft_step_{steps:05d}" / "adapter"
@@ -2660,9 +3489,42 @@ def finetune_qwen(
                             encoding="utf-8",
                         )
                         print(f"[checkpoint] saved stage=sft step={steps} -> {ckpt_adapter_dir}")
+                    # Eval monitoring with optional early stopping.
+                    if eval_every > 0 and eval_loader is not None and steps % eval_every == 0:
+                        model.eval()
+                        eval_loss_sum = 0.0
+                        eval_count = 0
+                        with torch.no_grad():
+                            for eval_batch in eval_loader:
+                                e_ids = eval_batch["input_ids"].to(device)
+                                e_mask = eval_batch["attention_mask"].to(device)
+                                e_labels = eval_batch["labels"].to(device)
+                                e_out = model(input_ids=e_ids, attention_mask=e_mask)
+                                e_logp, _ = _sequence_average_log_prob(e_out.logits, e_labels)
+                                eval_loss_sum += float((-e_logp).mean().item())
+                                eval_count += 1
+                        model.train()
+                        eval_loss = eval_loss_sum / max(1, eval_count)
+                        improved = eval_loss < best_eval_loss
+                        if improved:
+                            best_eval_loss = eval_loss
+                            eval_no_improve_count = 0
+                        else:
+                            eval_no_improve_count += 1
+                        print(
+                            f"[eval] step={steps} eval_loss={eval_loss:.4f} "
+                            f"best={best_eval_loss:.4f} no_improve={eval_no_improve_count}"
+                        )
+                        if early_stop_patience > 0 and eval_no_improve_count >= early_stop_patience:
+                            print(
+                                f"[eval] early stopping at step={steps}: "
+                                f"no improvement for {eval_no_improve_count} evaluations"
+                            )
+                            sft_early_stopped = True
+                            break
                     if steps >= max(1, int(max_steps)):
                         break
-            if steps >= max(1, int(max_steps)):
+            if sft_early_stopped or steps >= max(1, int(max_steps)):
                 break
         if checkpoint_every > 0 and steps > 0 and steps % checkpoint_every != 0:
             ckpt_adapter_dir = output_dir / "checkpoints" / f"sft_step_{steps:05d}" / "adapter"
@@ -2685,11 +3547,19 @@ def finetune_qwen(
             )
             print(f"[checkpoint] saved stage=sft step={steps} -> {ckpt_adapter_dir}")
 
-    pref_steps_done = 0
-    pref_loss_sum = 0.0
+    noise_hook = _replace_neftune_hook(
+        model=model,
+        hook=noise_hook,
+        noise_alpha=float(preference_neftune_noise_alpha),
+    )
+
+    pref_steps_done = max(0, int(resume_preference_steps))
+    pref_loss_sum = float(resume_preference_loss_mean) * float(pref_steps_done)
     pref_pair_count = 0
     pref_weight_mean = 0.0
     pref_reference_pairs = 0
+    pref_wpo_std_sum = 0.0
+    pref_robust_std_sum = 0.0
     pref_objective_mode = str(preference_objective).strip().lower()
     pref_beta_start = float(preference_beta)
     pref_beta_final = float(preference_beta)
@@ -2700,14 +3570,40 @@ def finetune_qwen(
     if float(preference_margin_end) >= 0.0:
         pref_margin_final = float(preference_margin_end)
     pref_hardness_gamma = max(0.0, float(preference_hardness_gamma))
+    pref_label_smoothing = max(0.0, min(0.49, float(preference_label_smoothing)))
+    pref_xpo_clip = max(0.0, float(preference_xpo_clip))
+    pref_robust_alpha = max(0.0, min(1.0, float(preference_robust_alpha)))
+    pref_robust_eta = max(0.0, min(0.49, float(preference_robust_eta)))
+    pref_robust_clip = max(1.0, float(preference_robust_clip))
     pref_anchor_weight = max(0.0, float(preference_reference_anchor_weight))
+    pref_ipo_target_start = (
+        _ipo_target_gap(beta=pref_beta_start, margin=pref_margin_start)
+        if pref_objective_mode == "ipo"
+        else 0.0
+    )
+    pref_ipo_target_final = (
+        _ipo_target_gap(beta=pref_beta_final, margin=pref_margin_final)
+        if pref_objective_mode == "ipo"
+        else 0.0
+    )
     if pref_objective_mode != "none" and int(preference_steps) > 0 and int(preference_pairs) > 0:
         print(f"[pref] building preference pairs (mode={pref_objective_mode})...")
+        ipo_schedule = (
+            f"ipo_target={pref_ipo_target_start:.4f}->{pref_ipo_target_final:.4f} "
+            if pref_objective_mode == "ipo"
+            else ""
+        )
         print(
             "[pref] objective schedule: "
             f"beta={pref_beta_start:.4f}->{pref_beta_final:.4f} "
             f"margin={pref_margin_start:.4f}->{pref_margin_final:.4f} "
+            f"{ipo_schedule}"
+            f"label_smoothing={pref_label_smoothing:.3f} "
+            f"xpo_clip={pref_xpo_clip:.3f} "
             f"hardness_gamma={pref_hardness_gamma:.3f} "
+            f"wpo_alpha={float(preference_wpo_alpha):.3f} "
+            f"robust_alpha={pref_robust_alpha:.3f} "
+            f"robust_eta={pref_robust_eta:.3f} "
             f"anchor_weight={pref_anchor_weight:.4f}"
         )
         pref_pairs = build_preference_pairs_with_generation(
@@ -2745,13 +3641,24 @@ def finetune_qwen(
             selection_hardness_bandwidth=float(preference_selection_hardness_bandwidth),
         )
         pref_pair_count = len(pref_pairs)
+        pref_rescore_rounds = 0
         if pref_pairs:
             pref_weight_mean = float(sum(float(p.weight) for p in pref_pairs) / max(1, len(pref_pairs)))
         print(f"[pref] pairs={pref_pair_count}")
         pref_rows = build_preference_rows(tokenizer, pref_pairs, max_length=max_length)
         if pref_rows:
-            if pref_anchor_weight > 0.0:
-                print("[pref] caching reference margins for trust-region anchoring...")
+            if pref_rescore_every > 0:
+                pref_rescore_rounds += 1
+                pref_weight_summary = _rescore_preference_rows(
+                    pref_rows=pref_rows,
+                    step=pref_steps_done,
+                    total_steps=max(1, int(preference_steps)),
+                    round_index=pref_rescore_rounds,
+                )
+                pref_weight_mean = float(pref_weight_summary.get("weight_mean", pref_weight_mean))
+            pref_needs_reference = pref_anchor_weight > 0.0 or pref_objective_mode in {"dpo", "ipo", "xpo"}
+            if pref_needs_reference:
+                print("[pref] caching reference log-probs for reference-aware preference optimization...")
                 pref_reference_pairs = annotate_preference_rows_with_reference_logps(
                     model=model,
                     pref_rows=pref_rows,
@@ -2769,10 +3676,15 @@ def finetune_qwen(
             )
 
             pref_optim = torch.optim.AdamW(
-                trainable_params,
-                lr=float(preference_lr),
-                weight_decay=float(weight_decay),
+                _build_optimizer_param_groups(
+                    model=model,
+                    base_lr=float(preference_lr),
+                    weight_decay=float(weight_decay),
+                    lora_plus_ratio=float(lora_plus_ratio),
+                )[0],
             )
+            for group in pref_optim.param_groups:
+                group.setdefault("initial_lr", group["lr"])
             pref_scheduler = torch.optim.lr_scheduler.LambdaLR(
                 pref_optim,
                 lr_lambda=_build_lr_lambda(
@@ -2781,9 +3693,15 @@ def finetune_qwen(
                     total_steps=max(1, int(preference_steps)),
                     min_lr_ratio=float(preference_min_lr_ratio),
                 ),
+                last_epoch=max(-1, pref_steps_done - 1),
             )
             pref_optim.zero_grad(set_to_none=True)
             model.train()
+            if pref_steps_done > 0:
+                print(
+                    "[resume] continuing preference stage from adapter "
+                    f"{init_path} at step={pref_steps_done} (optimizer state is reinitialized)"
+                )
 
             target_steps = max(1, int(preference_steps))
             pref_accum = 0
@@ -2816,22 +3734,96 @@ def finetune_qwen(
                         pref_steps_done,
                         target_steps,
                     )
+                    robust_logits = beta_t * (delta - margin_t)
 
                     if pref_objective_mode == "repo":
                         pref_core = torch.relu(margin_t - delta)
+                    elif pref_objective_mode == "dpo":
+                        ref_chosen = batch.get("ref_chosen_logp")
+                        ref_rejected = batch.get("ref_rejected_logp")
+                        if ref_chosen is None or ref_rejected is None:
+                            raise RuntimeError("DPO objective requires cached reference log-probabilities.")
+                        ref_delta = ref_chosen.to(device).float() - ref_rejected.to(device).float()
+                        robust_logits = beta_t * ((delta - ref_delta) - margin_t)
+                        pref_core = _dpo_preference_loss(
+                            delta=delta,
+                            ref_delta=ref_delta,
+                            beta=beta_t,
+                            margin=margin_t,
+                            label_smoothing=pref_label_smoothing,
+                        )
+                    elif pref_objective_mode == "ipo":
+                        ref_chosen = batch.get("ref_chosen_logp")
+                        ref_rejected = batch.get("ref_rejected_logp")
+                        if ref_chosen is None or ref_rejected is None:
+                            raise RuntimeError("IPO objective requires cached reference log-probabilities.")
+                        ref_delta = ref_chosen.to(device).float() - ref_rejected.to(device).float()
+                        robust_logits = beta_t * ((delta - ref_delta) - margin_t)
+                        pref_core = _ipo_preference_loss(
+                            delta=delta,
+                            ref_delta=ref_delta,
+                            beta=beta_t,
+                            margin=margin_t,
+                        )
+                    elif pref_objective_mode == "xpo":
+                        ref_chosen = batch.get("ref_chosen_logp")
+                        ref_rejected = batch.get("ref_rejected_logp")
+                        if ref_chosen is None or ref_rejected is None:
+                            raise RuntimeError("χPO objective requires cached reference log-probabilities.")
+                        robust_logits = _xpo_preference_logits_delta(
+                            chosen_logp=chosen_logp,
+                            rejected_logp=rejected_logp,
+                            ref_chosen_logp=ref_chosen.to(device).float(),
+                            ref_rejected_logp=ref_rejected.to(device).float(),
+                            beta=beta_t,
+                            clip=pref_xpo_clip,
+                        )
+                        pref_core = _xpo_preference_loss(
+                            chosen_logp=chosen_logp,
+                            rejected_logp=rejected_logp,
+                            ref_chosen_logp=ref_chosen.to(device).float(),
+                            ref_rejected_logp=ref_rejected.to(device).float(),
+                            beta=beta_t,
+                            clip=pref_xpo_clip,
+                            label_smoothing=pref_label_smoothing,
+                        )
                     elif pref_objective_mode == "orpo":
                         chosen_odds = _log_odds_from_avg_log_prob(chosen_logp)
                         rejected_odds = _log_odds_from_avg_log_prob(rejected_logp)
                         odds_delta = chosen_odds - rejected_odds
+                        robust_logits = beta_t * (odds_delta - margin_t)
                         pref_core = torch.nn.functional.softplus(-beta_t * (odds_delta - margin_t))
                     else:
                         z = beta_t * (delta - margin_t)
-                        pref_core = -torch.log(torch.sigmoid(z).clamp_min(1e-8))
+                        robust_logits = z
+                        pref_core = _sigmoid_preference_loss(z, label_smoothing=pref_label_smoothing)
 
                     if pref_hardness_gamma > 0.0:
                         hardness_weight = (1.0 - torch.sigmoid((beta_t * delta).detach())).pow(pref_hardness_gamma)
                         sample_weights = sample_weights * (1.0 + hardness_weight)
                         sample_weights = sample_weights / sample_weights.mean().clamp_min(1e-6)
+
+                    if float(preference_wpo_alpha) > 0.0:
+                        wpo_weights = _wpo_pair_weights(
+                            chosen_logp=chosen_logp,
+                            rejected_logp=rejected_logp,
+                            alpha=float(preference_wpo_alpha),
+                            clip=float(preference_wpo_clip),
+                        )
+                        sample_weights = sample_weights * wpo_weights
+                        sample_weights = sample_weights / sample_weights.mean().clamp_min(1e-6)
+                        pref_wpo_std_sum += float(wpo_weights.std(unbiased=False).item())
+
+                    if pref_robust_alpha > 0.0 and pref_robust_eta > 0.0:
+                        robust_weights = _robust_preference_correctness_weights(
+                            logits_delta=robust_logits,
+                            alpha=pref_robust_alpha,
+                            noise_eta=pref_robust_eta,
+                            clip=pref_robust_clip,
+                        )
+                        sample_weights = sample_weights * robust_weights
+                        sample_weights = sample_weights / sample_weights.mean().clamp_min(1e-6)
+                        pref_robust_std_sum += float(robust_weights.std(unbiased=False).item())
 
                     anchor_term = torch.zeros_like(pref_core)
                     if pref_anchor_weight > 0.0:
@@ -2855,6 +3847,15 @@ def finetune_qwen(
                     pref_accum += 1
 
                     pref_steps_done += 1
+                    if pref_rescore_every > 0 and pref_steps_done < target_steps and pref_steps_done % pref_rescore_every == 0:
+                        pref_rescore_rounds += 1
+                        pref_weight_summary = _rescore_preference_rows(
+                            pref_rows=pref_rows,
+                            step=pref_steps_done,
+                            total_steps=target_steps,
+                            round_index=pref_rescore_rounds,
+                        )
+                        pref_weight_mean = float(pref_weight_summary.get("weight_mean", pref_weight_mean))
                     should_step = (pref_accum % max(1, int(grad_accum_steps))) == 0 or pref_steps_done >= target_steps
                     if should_step:
                         if float(preference_max_grad_norm) > 0:
@@ -2879,7 +3880,8 @@ def finetune_qwen(
                         )
                         print(
                             f"[pref] step={pref_steps_done} loss={pref_loss_sum / max(1, pref_steps_done):.4f} "
-                            f"lr={pref_lr_now:.6g} beta={beta_now:.4f} margin={margin_now:.4f}"
+                            f"lr={pref_lr_now:.6g} beta={beta_now:.4f} margin={margin_now:.4f} "
+                            f"wpo_std={pref_wpo_std_sum / max(1, pref_steps_done):.4f}"
                         )
                     if checkpoint_every > 0 and pref_steps_done % checkpoint_every == 0:
                         ckpt_adapter_dir = output_dir / "checkpoints" / f"pref_step_{pref_steps_done:05d}" / "adapter"
@@ -2936,6 +3938,8 @@ def finetune_qwen(
     tokenizer.save_pretrained(adapter_dir)
     elapsed = max(1e-6, time.time() - t0)
     stats = {
+        "resume_sft_steps": float(max(0, int(resume_sft_steps))),
+        "resume_preference_steps": float(max(0, int(resume_preference_steps))),
         "sft_steps": float(steps),
         "sft_loss_mean": float(sft_loss_sum / max(1, steps)),
         "sft_lr_schedule": str(sft_lr_schedule).strip().lower(),
@@ -2952,6 +3956,19 @@ def finetune_qwen(
         "sft_prompt_skill_boost": float(sft_prompt_skill_boost),
         "sft_conversation_boost": float(sft_conversation_boost),
         "sft_creativity_boost": float(sft_creativity_boost),
+        "sft_followup_paraphrase_aug": float(max(0, int(sft_followup_paraphrase_aug))),
+        "sft_followup_paraphrase_weight": float(sft_followup_paraphrase_weight),
+        "sft_rdrop_alpha": float(max(0.0, sft_rdrop_alpha)),
+        "sft_rdrop_mean": float(sft_rdrop_sum / max(1, steps)),
+        "sft_focal_gamma": float(focal_gamma),
+        "sft_eval_every_steps": float(eval_every),
+        "sft_early_stop_patience": float(early_stop_patience),
+        "sft_early_stopped": bool(sft_early_stopped),
+        "sft_best_eval_loss": float(best_eval_loss) if best_eval_loss < float('inf') else 0.0,
+        "sft_curriculum_quality_ramp": float(curriculum_ramp),
+        "sft_grad_noise_eta": float(grad_noise_eta),
+        "sft_lr_restart_period": float(int(sft_lr_restart_period)),
+        "preference_rescore_every": float(pref_rescore_every),
         "preference_steps": float(pref_steps_done),
         "preference_loss_mean": float(pref_loss_sum / max(1, pref_steps_done)),
         "preference_pairs": float(pref_pair_count),
@@ -2961,7 +3978,18 @@ def finetune_qwen(
         "preference_beta_end": float(pref_beta_final),
         "preference_margin_start": float(pref_margin_start),
         "preference_margin_end": float(pref_margin_final),
+        "preference_ipo_target_start": float(pref_ipo_target_start),
+        "preference_ipo_target_end": float(pref_ipo_target_final),
+        "preference_label_smoothing": float(pref_label_smoothing),
+        "preference_xpo_clip": float(pref_xpo_clip),
         "preference_hardness_gamma": float(pref_hardness_gamma),
+        "preference_robust_alpha": float(pref_robust_alpha),
+        "preference_robust_eta": float(pref_robust_eta),
+        "preference_robust_clip": float(pref_robust_clip),
+        "preference_robust_std_mean": float(pref_robust_std_sum / max(1, pref_steps_done)),
+        "preference_wpo_alpha": float(max(0.0, preference_wpo_alpha)),
+        "preference_wpo_clip": float(max(1.0, preference_wpo_clip)),
+        "preference_wpo_std_mean": float(pref_wpo_std_sum / max(1, pref_steps_done)),
         "preference_reference_anchor_weight": float(pref_anchor_weight),
         "preference_reference_pairs": float(pref_reference_pairs),
         "preference_mining_mode": str(preference_mining_mode).strip().lower(),
@@ -2985,10 +4013,20 @@ def finetune_qwen(
         "train_tokens_per_sec": float(token_count / elapsed),
         "train_seconds": float(elapsed),
         "runtime_device": str(device),
+        "runtime_device_requested": str(runtime_device_requested),
+        "runtime_device_resolved": str(runtime_backend),
+        "runtime_device_preference": str(runtime_device_preference),
         "runtime_model_dtype": str(model_dtype),
         "runtime_gradient_checkpointing": bool(gradient_checkpointing),
+        "runtime_torch_num_threads": float(torch.get_num_threads()),
+        "runtime_torch_interop_threads": float(torch.get_num_interop_threads()),
         "lora_use_dora": bool(use_dora),
         "lora_use_rslora": bool(use_rslora),
+        "lora_plus_ratio": float(lora_plus_stats.get("lora_plus_ratio", 0.0)),
+        "lora_plus_base_group_params": float(lora_plus_stats.get("lora_plus_base_group_params", 0.0)),
+        "lora_plus_fast_group_params": float(lora_plus_stats.get("lora_plus_fast_group_params", 0.0)),
+        "neftune_noise_alpha": float(neftune_noise_alpha),
+        "preference_neftune_noise_alpha": float(preference_neftune_noise_alpha),
         "init_adapter_match_lora": bool(init_adapter_match_lora),
         "save_every_steps": float(checkpoint_every),
         "skip_sft": bool(skip_sft),
@@ -3110,6 +4148,194 @@ def save_jsonl(path: Path, pairs: Sequence[ChatPair]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def load_saved_chat_pairs(path: Path) -> List[ChatPair]:
+    pairs: List[ChatPair] = []
+    if not path.exists():
+        return pairs
+    with path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                continue
+            user = _coerce_text(record.get("user"))
+            assistant = _coerce_text(record.get("assistant"))
+            if not user or not assistant:
+                continue
+            pairs.append(
+                ChatPair(
+                    user=user,
+                    assistant=assistant,
+                    source=_coerce_text(record.get("source")) or "dataset",
+                )
+            )
+    return pairs
+
+
+def _path_fingerprint(raw_path: str) -> Dict[str, object]:
+    path = Path(raw_path)
+    try:
+        resolved = str(path.resolve(strict=False))
+    except Exception:
+        resolved = str(path)
+    try:
+        stat = path.stat()
+        size = int(stat.st_size)
+        mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+    except OSError:
+        size = -1
+        mtime_ns = -1
+    return {
+        "path": resolved,
+        "size": size,
+        "mtime_ns": mtime_ns,
+    }
+
+
+def _prepared_data_cache_key(payload: Dict[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _prepared_data_cache_paths(output_dir: Path) -> Tuple[Path, Path, Path]:
+    return (
+        output_dir / "prepared_data_cache_meta.json",
+        output_dir / "prepared_train_pairs.jsonl",
+        output_dir / "prepared_eval_pairs.jsonl",
+    )
+
+
+def _load_prepared_data_cache(
+    output_dir: Path,
+    cache_key: str,
+) -> Optional[Tuple[List[ChatPair], List[ChatPair], Dict[str, object]]]:
+    meta_path, train_path, eval_path = _prepared_data_cache_paths(output_dir)
+    if not (meta_path.exists() and train_path.exists() and eval_path.exists()):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[data] failed to read prepared cache meta {meta_path}: {e}")
+        return None
+    if not isinstance(meta, dict) or str(meta.get("cache_key") or "").strip() != str(cache_key):
+        return None
+    train_pairs = load_saved_chat_pairs(train_path)
+    eval_pairs = load_saved_chat_pairs(eval_path)
+    expected_train = int(meta.get("train_count", 0) or 0)
+    expected_eval = int(meta.get("eval_count", 0) or 0)
+    if len(train_pairs) != expected_train or len(eval_pairs) != expected_eval:
+        print(
+            "[data] prepared cache counts mismatch; rebuilding "
+            f"(train={len(train_pairs)}/{expected_train} eval={len(eval_pairs)}/{expected_eval})"
+        )
+        return None
+    return train_pairs, eval_pairs, meta
+
+
+def _save_prepared_data_cache(
+    output_dir: Path,
+    cache_key: str,
+    cache_payload: Dict[str, object],
+    train_pairs: Sequence[ChatPair],
+    eval_pairs: Sequence[ChatPair],
+    raw_eval_count: int,
+) -> None:
+    meta_path, train_path, eval_path = _prepared_data_cache_paths(output_dir)
+    save_jsonl(train_path, train_pairs)
+    save_jsonl(eval_path, eval_pairs)
+    meta = {
+        "cache_key": str(cache_key),
+        "cache_version": 1,
+        "raw_eval_count": int(raw_eval_count),
+        "train_count": int(len(train_pairs)),
+        "eval_count": int(len(eval_pairs)),
+        "created_at": float(time.time()),
+        "config": cache_payload,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"[data] cached prepared split -> {meta_path}")
+
+
+def _merge_distillation_pairs(
+    train_pairs: Sequence[ChatPair],
+    distilled_pairs: Sequence[ChatPair],
+    seed: int,
+) -> Tuple[List[ChatPair], int]:
+    seen = {(pair.user, pair.assistant) for pair in train_pairs}
+    mixed = list(train_pairs)
+    added = 0
+    for pair in distilled_pairs:
+        key = (pair.user, pair.assistant)
+        if key in seen:
+            continue
+        seen.add(key)
+        mixed.append(pair)
+        added += 1
+    random.Random(seed).shuffle(mixed)
+    return mixed, added
+
+
+def _read_resume_checkpoint(meta_path: Path) -> Optional[ResumeCheckpoint]:
+    try:
+        raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[resume] failed to read checkpoint meta {meta_path}: {e}")
+        return None
+    if not isinstance(raw, dict):
+        return None
+    adapter_dir_raw = str(raw.get("checkpoint_adapter_dir") or "").strip()
+    if not adapter_dir_raw:
+        return None
+    adapter_dir = Path(adapter_dir_raw)
+    if not adapter_dir.exists():
+        adapter_dir = meta_path.parent / "adapter"
+    if not adapter_dir.exists():
+        return None
+    return ResumeCheckpoint(
+        adapter_dir=adapter_dir,
+        stage=str(raw.get("stage") or "").strip().lower() or "sft",
+        sft_steps=max(0, int(raw.get("sft_steps", 0) or 0)),
+        preference_steps=max(0, int(raw.get("preference_steps", 0) or 0)),
+        sft_loss_mean=float(raw.get("sft_loss_mean", 0.0) or 0.0),
+        preference_loss_mean=float(raw.get("preference_loss_mean", 0.0) or 0.0),
+    )
+
+
+def _resolve_latest_resume_checkpoint(output_dir: Path) -> Optional[ResumeCheckpoint]:
+    latest_ptr = output_dir / "latest_adapter_checkpoint.txt"
+    if latest_ptr.exists():
+        adapter_dir = Path(latest_ptr.read_text(encoding="utf-8").strip())
+        meta_path = adapter_dir.parent / "checkpoint_meta.json"
+        if meta_path.exists():
+            state = _read_resume_checkpoint(meta_path)
+            if state is not None:
+                return state
+
+    latest_state: Optional[ResumeCheckpoint] = None
+    latest_mtime = -1.0
+    latest_progress_key = (-1, -1, -1.0)
+    for meta_path in output_dir.glob("checkpoints/*/checkpoint_meta.json"):
+        state = _read_resume_checkpoint(meta_path)
+        if state is None:
+            continue
+        try:
+            mtime = meta_path.stat().st_mtime
+        except OSError:
+            mtime = -1.0
+        progress_key = (
+            1 if state.stage == "preference" else 0,
+            int(state.preference_steps if state.stage == "preference" else state.sft_steps),
+            float(state.sft_steps),
+        )
+        if mtime > latest_mtime or (mtime == latest_mtime and progress_key >= latest_progress_key):
+            latest_state = state
+            latest_mtime = mtime
+            latest_progress_key = progress_key
+    return latest_state
+
+
 def plot_benchmark(results: Dict[str, Dict[str, float]], out_png: Path) -> None:
     out_png.parent.mkdir(parents=True, exist_ok=True)
     models = ["base", "tuned"]
@@ -3181,6 +4407,17 @@ def parse_args() -> argparse.Namespace:
         help="Log dataset loading progress every N accepted pairs (0 disables).",
     )
     ap.add_argument("--eval_size", type=int, default=64)
+    ap.add_argument(
+        "--eval_min_quality_score",
+        type=float,
+        default=-1e9,
+        help="Drop eval pairs below this paired-response score (disabled by default).",
+    )
+    ap.add_argument(
+        "--eval_drop_synthetic_prompts",
+        action="store_true",
+        help="Drop synthetic/template prompts from eval_pairs.jsonl and benchmark inputs.",
+    )
     ap.add_argument("--max_length", type=int, default=384)
     ap.add_argument("--max_new_tokens", type=int, default=64)
     ap.add_argument("--batch_size", type=int, default=1)
@@ -3190,9 +4427,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument(
         "--sft_lr_schedule",
-        choices=["constant", "cosine"],
+        choices=["constant", "cosine", "cosine_restarts"],
         default="constant",
         help="Learning-rate schedule for SFT optimizer.",
+    )
+    ap.add_argument(
+        "--sft_lr_restart_period",
+        type=int,
+        default=0,
+        help="Period (in steps) for cosine_restarts LR schedule (0 disables restarts).",
     )
     ap.add_argument(
         "--sft_warmup_steps",
@@ -3240,7 +4483,19 @@ def parse_args() -> argparse.Namespace:
         default="true",
         help="LoRA init mode: true|false|gaussian|pissa_niter_4|olora|eva|corda",
     )
+    ap.add_argument(
+        "--lora_plus_ratio",
+        type=float,
+        default=0.0,
+        help="LoRA+ learning-rate ratio for LoRA-B parameters (>1 enables separate fast group).",
+    )
     ap.add_argument("--neftune_noise_alpha", type=float, default=0.0)
+    ap.add_argument(
+        "--preference_neftune_noise_alpha",
+        type=float,
+        default=0.0,
+        help="Optional NEFTune embedding-noise alpha used only during preference training.",
+    )
     ap.add_argument(
         "--sft_weight_mode",
         choices=["none", "quality"],
@@ -3289,6 +4544,54 @@ def parse_args() -> argparse.Namespace:
         help="Extra SFT weight multiplier for prompts that explicitly ask for creative answers.",
     )
     ap.add_argument(
+        "--sft_followup_paraphrase_aug",
+        type=int,
+        default=1,
+        help="How many deterministic paraphrase variants to add per follow-up SFT prompt (0 disables).",
+    )
+    ap.add_argument(
+        "--sft_followup_paraphrase_weight",
+        type=float,
+        default=0.72,
+        help="Sample-weight multiplier for follow-up paraphrase augmentation rows.",
+    )
+    ap.add_argument(
+        "--sft_rdrop_alpha",
+        type=float,
+        default=0.0,
+        help="R-Drop symmetric-KL regularization weight during SFT (0 disables).",
+    )
+    ap.add_argument(
+        "--sft_focal_gamma",
+        type=float,
+        default=0.0,
+        help="Focal-loss gamma for SFT: down-weight easy samples, amplify hard ones (0 disables).",
+    )
+    ap.add_argument(
+        "--sft_eval_every_steps",
+        type=int,
+        default=0,
+        help="Run eval monitoring every N SFT steps and log eval loss (0 disables).",
+    )
+    ap.add_argument(
+        "--sft_early_stop_patience",
+        type=int,
+        default=0,
+        help="Stop SFT early if eval loss doesn't improve for N consecutive evaluations (0 disables).",
+    )
+    ap.add_argument(
+        "--sft_curriculum_quality_ramp",
+        type=float,
+        default=0.0,
+        help="Curriculum ramp: reduce weight of below-median samples early in training, restored over 50%% of steps (0 disables).",
+    )
+    ap.add_argument(
+        "--sft_grad_noise_eta",
+        type=float,
+        default=0.0,
+        help="Gradient noise injection eta (Neelakantan-style, decaying) for escaping sharp minima (0 disables).",
+    )
+    ap.add_argument(
         "--sft_auto_balance_sources",
         action="store_true",
         help="Auto-balance SFT source contributions via per-source sample-weight scaling.",
@@ -3322,14 +4625,19 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated source filenames exempt from SFT quality filtering.",
     )
     ap.add_argument(
+        "--sft_drop_synthetic_prompts",
+        action="store_true",
+        help="Drop synthetic/template prompts from SFT even if they pass quality filtering.",
+    )
+    ap.add_argument(
         "--lora_targets",
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
     )
     ap.add_argument(
         "--preference_objective",
-        choices=["none", "simpo", "repo", "orpo"],
+        choices=["none", "simpo", "dpo", "ipo", "xpo", "repo", "orpo"],
         default="none",
-        help="Preference stage objective. simpo uses sigmoid log-loss; repo uses ReLU-margin; orpo uses odds-ratio logistic.",
+        help="Preference stage objective. simpo uses sigmoid log-loss; dpo uses reference-relative preference optimization; ipo regresses toward a finite reference-relative target gap; xpo uses chi-square-link preference optimization; repo uses ReLU-margin; orpo uses odds-ratio logistic.",
     )
     ap.add_argument("--preference_steps", type=int, default=0)
     ap.add_argument("--preference_pairs", type=int, default=0)
@@ -3347,6 +4655,18 @@ def parse_args() -> argparse.Namespace:
         default=-1.0,
         help="Optional final margin for linear schedule over preference steps (<0 keeps margin constant).",
     )
+    ap.add_argument(
+        "--preference_label_smoothing",
+        type=float,
+        default=0.0,
+        help="Conservative label smoothing for logistic preference losses such as DPO/SimPO (0 disables).",
+    )
+    ap.add_argument(
+        "--preference_xpo_clip",
+        type=float,
+        default=0.0,
+        help="Optional clip radius for χPO preference logits delta (0 disables clipping).",
+    )
     ap.add_argument("--preference_sft_weight", type=float, default=0.2)
     ap.add_argument("--preference_length_weight", type=float, default=0.05)
     ap.add_argument(
@@ -3354,6 +4674,36 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Hard-example amplification gamma for preference sample weights (0 disables).",
+    )
+    ap.add_argument(
+        "--preference_robust_alpha",
+        type=float,
+        default=0.0,
+        help="RE-PO-style posterior-correctness reweighting blend for noisy preference pairs (0 disables).",
+    )
+    ap.add_argument(
+        "--preference_robust_eta",
+        type=float,
+        default=0.0,
+        help="Assumed label-flip rate for RE-PO-style robust preference weighting.",
+    )
+    ap.add_argument(
+        "--preference_robust_clip",
+        type=float,
+        default=3.0,
+        help="Clamp RE-PO-style robust preference weights to [1/clip, clip] after normalization.",
+    )
+    ap.add_argument(
+        "--preference_wpo_alpha",
+        type=float,
+        default=0.0,
+        help="Tempered WPO-style current-policy pair reweighting strength (0 disables).",
+    )
+    ap.add_argument(
+        "--preference_wpo_clip",
+        type=float,
+        default=3.0,
+        help="Clamp WPO-style pair weights to [1/clip, clip] after normalization.",
     )
     ap.add_argument(
         "--preference_reference_anchor_weight",
@@ -3370,7 +4720,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--preference_lr", type=float, default=8e-5)
     ap.add_argument(
         "--preference_lr_schedule",
-        choices=["constant", "cosine"],
+        choices=["constant", "cosine", "cosine_restarts"],
         default="constant",
         help="Learning-rate schedule for preference optimizer.",
     )
@@ -3542,7 +4892,18 @@ def parse_args() -> argparse.Namespace:
         help="Bandwidth around hardness target for capacity_aware pair selection.",
     )
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    ap.add_argument(
+        "--preference_rescore_every",
+        type=int,
+        default=0,
+        help="Re-score preference pair weights every N steps during preference training (0 disables).",
+    )
+    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps", "xpu", "npu", "dml"])
+    ap.add_argument(
+        "--device_preference",
+        default="cuda,npu,xpu,dml,mps,cpu",
+        help="Priority order used when --device auto (supports cuda,npu,xpu,dml,mps,cpu).",
+    )
     ap.add_argument(
         "--model_dtype",
         choices=["auto", "float32", "float16", "bfloat16"],
@@ -3554,8 +4915,37 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable model gradient checkpointing for larger-model memory savings.",
     )
+    ap.add_argument(
+        "--torch_num_threads",
+        type=int,
+        default=0,
+        help="Torch intra-op CPU threads (0 uses automatic host-core count).",
+    )
+    ap.add_argument(
+        "--torch_interop_threads",
+        type=int,
+        default=0,
+        help="Torch inter-op CPU threads (0 uses a conservative automatic value).",
+    )
+    ap.add_argument(
+        "--matmul_precision",
+        choices=["highest", "high", "medium"],
+        default="high",
+        help="Torch float32 matmul precision hint.",
+    )
+    ap.add_argument(
+        "--disable_tf32",
+        action="store_true",
+        help="Disable TF32 when running on CUDA-capable hardware.",
+    )
     ap.add_argument("--supermix_distill_ratio", type=float, default=0.25)
     ap.add_argument("--supermix_distill_max", type=int, default=120)
+    ap.add_argument(
+        "--supermix_distill_best_of",
+        type=int,
+        default=1,
+        help="Sample up to N Supermix teacher candidates at different temperatures and keep the best-scoring response.",
+    )
     ap.add_argument(
         "--supermix_distill_log_every",
         type=int,
@@ -3573,6 +4963,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Minimum quality score required for teacher-generated distillation responses.",
+    )
+    ap.add_argument(
+        "--supermix_distill_min_gain",
+        type=float,
+        default=0.0,
+        help="Require teacher-generated distillation responses to beat the original assistant answer by this margin.",
     )
     ap.add_argument(
         "--supermix_distill_allow_synthetic_prompts",
@@ -3598,6 +4994,11 @@ def parse_args() -> argparse.Namespace:
         help="Match LoRA rank/alpha/dropout/targets to init adapter config for warm-start compatibility.",
     )
     ap.add_argument(
+        "--resume_from_latest_checkpoint",
+        action="store_true",
+        help="Resume from the latest checkpoint under --output_dir and continue step counts/LR schedules.",
+    )
+    ap.add_argument(
         "--skip_benchmark",
         action="store_true",
         help="Skip base/tuned benchmark generation to speed up training iteration.",
@@ -3609,16 +5010,56 @@ def main() -> None:
     args = parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = _resolve_device(str(args.device))
-    model_dtype = _resolve_torch_dtype(str(args.model_dtype), device=device)
+    configure_torch_runtime(
+        torch_num_threads=int(args.torch_num_threads),
+        torch_interop_threads=int(args.torch_interop_threads),
+        allow_tf32=not bool(args.disable_tf32),
+        matmul_precision=str(args.matmul_precision),
+    )
+    device, device_info = _resolve_device(
+        str(args.device),
+        device_preference=str(args.device_preference),
+    )
+    runtime_backend = str(device_info.get("resolved", _device_backend_name(device))).strip().lower() or "cpu"
+    model_dtype = _resolve_torch_dtype(
+        str(args.model_dtype),
+        device=device,
+        resolved_backend=runtime_backend,
+    )
     print(
         "[runtime] "
-        f"device={device.type} model_dtype={str(model_dtype)} "
-        f"gradient_checkpointing={bool(args.gradient_checkpointing)}"
+        f"requested={device_info.get('requested', str(args.device))} "
+        f"resolved={runtime_backend} "
+        f"device={device_info.get('device_repr', str(device))} "
+        f"model_dtype={str(model_dtype)} "
+        f"gradient_checkpointing={bool(args.gradient_checkpointing)} "
+        f"torch_threads={torch.get_num_threads()} "
+        f"interop_threads={torch.get_num_interop_threads()} "
+        f"preference={device_info.get('preference', str(args.device_preference))}"
     )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    resume_state: Optional[ResumeCheckpoint] = None
+    if bool(args.resume_from_latest_checkpoint):
+        explicit_init = str(args.init_adapter_dir or "").strip()
+        if explicit_init:
+            print("[resume] explicit --init_adapter_dir set; skipping auto latest-checkpoint lookup.")
+        else:
+            resume_state = _resolve_latest_resume_checkpoint(output_dir)
+            if resume_state is None:
+                print(f"[resume] no checkpoint found under {output_dir}; starting fresh.")
+            else:
+                args.init_adapter_dir = str(resume_state.adapter_dir)
+                if resume_state.stage == "preference":
+                    args.skip_sft = True
+                print(
+                    "[resume] resolved latest checkpoint: "
+                    f"stage={resume_state.stage} "
+                    f"sft_steps={resume_state.sft_steps} "
+                    f"preference_steps={resume_state.preference_steps} "
+                    f"adapter={resume_state.adapter_dir}"
+                )
     if bool(args.skip_sft) and not str(args.init_adapter_dir or "").strip():
         raise ValueError("--skip_sft requires --init_adapter_dir to load an existing adapter.")
     prompt_sig_exempt_sources = [
@@ -3633,38 +5074,95 @@ def main() -> None:
     ]
 
     print("[data] loading Supermix pairs...")
-    all_pairs = load_jsonl_pairs(
-        args.data,
-        max_records=max(2, int(args.max_records)),
-        max_source_fraction=float(args.max_source_fraction),
-        max_synthetic_fraction=float(args.max_synthetic_fraction),
-        max_prompt_signature_count=int(args.max_prompt_signature_count),
-        prompt_signature_cap_exempt_sources=prompt_sig_exempt_sources,
-        log_every_records=int(args.data_log_every_records),
-    )
-    print(f"[data] loaded={len(all_pairs)}")
-    train_pairs, eval_pairs = split_train_eval(all_pairs, eval_size=int(args.eval_size), seed=int(args.seed))
-    print(f"[data] train={len(train_pairs)} eval={len(eval_pairs)}")
+    prepared_cache_payload = {
+        "data_files": [_path_fingerprint(p) for p in args.data],
+        "max_records": int(args.max_records),
+        "max_source_fraction": float(args.max_source_fraction),
+        "max_synthetic_fraction": float(args.max_synthetic_fraction),
+        "max_prompt_signature_count": int(args.max_prompt_signature_count),
+        "prompt_signature_cap_exempt_sources": sorted(prompt_sig_exempt_sources),
+        "eval_size": int(args.eval_size),
+        "eval_min_quality_score": float(args.eval_min_quality_score),
+        "eval_drop_synthetic_prompts": bool(args.eval_drop_synthetic_prompts),
+        "seed": int(args.seed),
+    }
+    prepared_cache_key = _prepared_data_cache_key(prepared_cache_payload)
+    cached_prepared = _load_prepared_data_cache(output_dir, prepared_cache_key)
+    if cached_prepared is not None:
+        train_pairs, eval_pairs, prepared_cache_meta = cached_prepared
+        raw_eval_count = int(prepared_cache_meta.get("raw_eval_count", len(eval_pairs)) or len(eval_pairs))
+        print(
+            "[data] reused prepared cache: "
+            f"train={len(train_pairs)} eval={len(eval_pairs)} raw_eval={raw_eval_count}"
+        )
+    else:
+        all_pairs = load_jsonl_pairs(
+            args.data,
+            max_records=max(2, int(args.max_records)),
+            max_source_fraction=float(args.max_source_fraction),
+            max_synthetic_fraction=float(args.max_synthetic_fraction),
+            max_prompt_signature_count=int(args.max_prompt_signature_count),
+            prompt_signature_cap_exempt_sources=prompt_sig_exempt_sources,
+            log_every_records=int(args.data_log_every_records),
+        )
+        print(f"[data] loaded={len(all_pairs)}")
+        train_pairs, eval_pairs = split_train_eval(all_pairs, eval_size=int(args.eval_size), seed=int(args.seed))
+        raw_eval_count = len(eval_pairs)
+        eval_pairs = filter_eval_pairs(
+            eval_pairs,
+            min_quality_score=float(args.eval_min_quality_score),
+            drop_synthetic_prompts=bool(args.eval_drop_synthetic_prompts),
+        )
+        _save_prepared_data_cache(
+            output_dir=output_dir,
+            cache_key=prepared_cache_key,
+            cache_payload=prepared_cache_payload,
+            train_pairs=train_pairs,
+            eval_pairs=eval_pairs,
+            raw_eval_count=raw_eval_count,
+        )
+    print(f"[data] train={len(train_pairs)} eval={len(eval_pairs)} (raw_eval={raw_eval_count})")
 
     teacher_generated = 0
+    distill_cache_jsonl = output_dir / "teacher_distill_pairs.jsonl"
     if args.supermix_distill_ratio > 0 and args.supermix_distill_max > 0:
-        print("[distill] loading Supermix teacher...")
-        teacher = SupermixTeacher(
-            weights_path=args.supermix_weights,
-            meta_path=args.supermix_meta,
-            device=str(device),
-        )
-        train_pairs, teacher_generated = apply_supermix_distillation(
-            train_pairs=train_pairs,
-            teacher=teacher,
-            ratio=float(args.supermix_distill_ratio),
-            max_teacher_samples=int(args.supermix_distill_max),
-            seed=int(args.seed),
-            min_quality_score=float(args.supermix_distill_min_quality),
-            skip_synthetic_prompts=not bool(args.supermix_distill_allow_synthetic_prompts),
-            log_every=int(args.supermix_distill_log_every),
-            max_seconds=float(args.supermix_distill_max_seconds),
-        )
+        reused_cache = False
+        if resume_state is not None and distill_cache_jsonl.exists():
+            cached_teacher_pairs = load_saved_chat_pairs(distill_cache_jsonl)
+            if cached_teacher_pairs:
+                train_pairs, teacher_generated = _merge_distillation_pairs(
+                    train_pairs,
+                    cached_teacher_pairs,
+                    seed=int(args.seed),
+                )
+                reused_cache = True
+                print(
+                    f"[distill] reused cached teacher pairs={teacher_generated} from {distill_cache_jsonl}"
+                )
+        if not reused_cache:
+            print("[distill] loading Supermix teacher...")
+            teacher = SupermixTeacher(
+                weights_path=args.supermix_weights,
+                meta_path=args.supermix_meta,
+                device=str(device),
+            )
+            train_pairs, teacher_generated = apply_supermix_distillation(
+                train_pairs=train_pairs,
+                teacher=teacher,
+                ratio=float(args.supermix_distill_ratio),
+                max_teacher_samples=int(args.supermix_distill_max),
+                seed=int(args.seed),
+                min_quality_score=float(args.supermix_distill_min_quality),
+                min_quality_gain=float(args.supermix_distill_min_gain),
+                skip_synthetic_prompts=not bool(args.supermix_distill_allow_synthetic_prompts),
+                log_every=int(args.supermix_distill_log_every),
+                max_seconds=float(args.supermix_distill_max_seconds),
+                best_of=int(args.supermix_distill_best_of),
+            )
+            teacher_pairs = [pair for pair in train_pairs if str(pair.source) == "supermix_teacher"]
+            if teacher_pairs:
+                save_jsonl(distill_cache_jsonl, teacher_pairs)
+                print(f"[distill] cached teacher pairs -> {distill_cache_jsonl}")
         print(f"[distill] teacher_generated={teacher_generated} train_after_mix={len(train_pairs)}")
 
     eval_jsonl = output_dir / "eval_pairs.jsonl"
@@ -3676,6 +5174,9 @@ def main() -> None:
         train_pairs=train_pairs,
         output_dir=output_dir,
         device=device,
+        runtime_device_requested=str(device_info.get("requested", str(args.device))),
+        runtime_device_resolved=runtime_backend,
+        runtime_device_preference=str(device_info.get("preference", str(args.device_preference))),
         model_dtype=model_dtype,
         gradient_checkpointing=bool(args.gradient_checkpointing),
         max_length=int(args.max_length),
@@ -3697,7 +5198,9 @@ def main() -> None:
         use_dora=bool(args.use_dora),
         use_rslora=bool(args.use_rslora),
         lora_init=str(args.lora_init),
+        lora_plus_ratio=float(args.lora_plus_ratio),
         neftune_noise_alpha=float(args.neftune_noise_alpha),
+        preference_neftune_noise_alpha=float(args.preference_neftune_noise_alpha),
         sft_weight_mode=str(args.sft_weight_mode),
         sft_min_weight=float(args.sft_min_weight),
         sft_max_weight=float(args.sft_max_weight),
@@ -3710,12 +5213,23 @@ def main() -> None:
         sft_prompt_skill_boost=float(args.sft_prompt_skill_boost),
         sft_conversation_boost=float(args.sft_conversation_boost),
         sft_creativity_boost=float(args.sft_creativity_boost),
+        sft_followup_paraphrase_aug=int(args.sft_followup_paraphrase_aug),
+        sft_followup_paraphrase_weight=float(args.sft_followup_paraphrase_weight),
+        sft_rdrop_alpha=float(args.sft_rdrop_alpha),
         sft_min_quality_score=float(args.sft_min_quality_score),
         sft_filter_keep_short_answers=not bool(args.sft_filter_drop_short_answers),
+        sft_drop_synthetic_prompts=bool(args.sft_drop_synthetic_prompts),
         sft_quality_filter_exempt_sources=sft_filter_exempt_sources,
         sft_auto_balance_sources=bool(args.sft_auto_balance_sources),
         sft_source_balance_strength=float(args.sft_source_balance_strength),
         sft_source_balance_max_scale=float(args.sft_source_balance_max_scale),
+        sft_lr_restart_period=int(args.sft_lr_restart_period),
+        sft_focal_gamma=float(args.sft_focal_gamma),
+        sft_eval_every_steps=int(args.sft_eval_every_steps),
+        sft_early_stop_patience=int(args.sft_early_stop_patience),
+        sft_curriculum_quality_ramp=float(args.sft_curriculum_quality_ramp),
+        sft_grad_noise_eta=float(args.sft_grad_noise_eta),
+        eval_pairs=eval_pairs,
         preference_objective=str(args.preference_objective),
         preference_steps=int(args.preference_steps),
         preference_pairs=int(args.preference_pairs),
@@ -3723,9 +5237,16 @@ def main() -> None:
         preference_beta_end=float(args.preference_beta_end),
         preference_margin=float(args.preference_margin),
         preference_margin_end=float(args.preference_margin_end),
+        preference_label_smoothing=float(args.preference_label_smoothing),
+        preference_xpo_clip=float(args.preference_xpo_clip),
         preference_sft_weight=float(args.preference_sft_weight),
         preference_length_weight=float(args.preference_length_weight),
         preference_hardness_gamma=float(args.preference_hardness_gamma),
+        preference_robust_alpha=float(args.preference_robust_alpha),
+        preference_robust_eta=float(args.preference_robust_eta),
+        preference_robust_clip=float(args.preference_robust_clip),
+        preference_wpo_alpha=float(args.preference_wpo_alpha),
+        preference_wpo_clip=float(args.preference_wpo_clip),
         preference_reference_anchor_weight=float(args.preference_reference_anchor_weight),
         preference_reference_anchor_batch_size=int(args.preference_reference_anchor_batch_size),
         preference_lr=float(args.preference_lr),
@@ -3762,9 +5283,16 @@ def main() -> None:
         preference_selection_hardness_bandwidth=float(args.preference_selection_hardness_bandwidth),
         seed=int(args.seed),
         save_every_steps=int(args.save_every_steps),
+        preference_rescore_every=int(args.preference_rescore_every),
         skip_sft=bool(args.skip_sft),
         init_adapter_match_lora=bool(args.init_adapter_match_lora),
         init_adapter_dir=str(args.init_adapter_dir or "").strip() or None,
+        resume_sft_steps=int(resume_state.sft_steps if resume_state is not None else 0),
+        resume_preference_steps=int(resume_state.preference_steps if resume_state is not None else 0),
+        resume_sft_loss_mean=float(resume_state.sft_loss_mean if resume_state is not None else 0.0),
+        resume_preference_loss_mean=float(
+            resume_state.preference_loss_mean if resume_state is not None else 0.0
+        ),
     )
 
     if bool(args.skip_benchmark):
@@ -3795,8 +5323,18 @@ def main() -> None:
         "config": {
             "base_model": args.base_model,
             "device": str(device),
+            "device_requested": str(device_info.get("requested", str(args.device))),
+            "device_resolved": runtime_backend,
+            "device_preference": str(device_info.get("preference", str(args.device_preference))),
             "model_dtype": str(model_dtype),
             "gradient_checkpointing": bool(args.gradient_checkpointing),
+            "torch_num_threads": int(torch.get_num_threads()),
+            "torch_interop_threads": int(torch.get_num_interop_threads()),
+            "matmul_precision": str(args.matmul_precision),
+            "tf32_enabled": not bool(args.disable_tf32),
+            "resume_from_latest_checkpoint": bool(args.resume_from_latest_checkpoint),
+            "resolved_resume_stage": str(resume_state.stage) if resume_state is not None else "",
+            "resolved_resume_adapter": str(resume_state.adapter_dir) if resume_state is not None else "",
             "max_records": int(args.max_records),
             "max_source_fraction": float(args.max_source_fraction),
             "max_synthetic_fraction": float(args.max_synthetic_fraction),
@@ -3804,6 +5342,8 @@ def main() -> None:
             "data_log_every_records": int(args.data_log_every_records),
             "prompt_signature_cap_exempt_sources": prompt_sig_exempt_sources,
             "eval_size": int(args.eval_size),
+            "eval_min_quality_score": float(args.eval_min_quality_score),
+            "eval_drop_synthetic_prompts": bool(args.eval_drop_synthetic_prompts),
             "max_steps": int(args.max_steps),
             "max_length": int(args.max_length),
             "lr": float(args.lr),
@@ -3816,17 +5356,22 @@ def main() -> None:
             "skip_sft": bool(args.skip_sft),
             "supermix_distill_ratio": float(args.supermix_distill_ratio),
             "supermix_distill_max": int(args.supermix_distill_max),
+            "supermix_distill_best_of": int(args.supermix_distill_best_of),
             "supermix_distill_log_every": int(args.supermix_distill_log_every),
             "supermix_distill_max_seconds": float(args.supermix_distill_max_seconds),
             "supermix_distill_min_quality": float(args.supermix_distill_min_quality),
+            "supermix_distill_min_gain": float(args.supermix_distill_min_gain),
             "supermix_distill_allow_synthetic_prompts": bool(
                 args.supermix_distill_allow_synthetic_prompts
             ),
+            "distill_cache_path": str(distill_cache_jsonl),
             "teacher_generated": int(teacher_generated),
             "use_dora": bool(args.use_dora),
             "use_rslora": bool(args.use_rslora),
             "lora_init": str(args.lora_init),
+            "lora_plus_ratio": float(args.lora_plus_ratio),
             "neftune_noise_alpha": float(args.neftune_noise_alpha),
+            "preference_neftune_noise_alpha": float(args.preference_neftune_noise_alpha),
             "sft_weight_mode": str(args.sft_weight_mode),
             "sft_min_weight": float(args.sft_min_weight),
             "sft_max_weight": float(args.sft_max_weight),
@@ -3839,8 +5384,19 @@ def main() -> None:
             "sft_prompt_skill_boost": float(args.sft_prompt_skill_boost),
             "sft_conversation_boost": float(args.sft_conversation_boost),
             "sft_creativity_boost": float(args.sft_creativity_boost),
+            "sft_followup_paraphrase_aug": int(args.sft_followup_paraphrase_aug),
+            "sft_followup_paraphrase_weight": float(args.sft_followup_paraphrase_weight),
+            "sft_rdrop_alpha": float(args.sft_rdrop_alpha),
+            "sft_focal_gamma": float(args.sft_focal_gamma),
+            "sft_eval_every_steps": int(args.sft_eval_every_steps),
+            "sft_early_stop_patience": int(args.sft_early_stop_patience),
+            "sft_curriculum_quality_ramp": float(args.sft_curriculum_quality_ramp),
+            "sft_grad_noise_eta": float(args.sft_grad_noise_eta),
+            "sft_lr_restart_period": int(args.sft_lr_restart_period),
+            "preference_rescore_every": int(args.preference_rescore_every),
             "sft_min_quality_score": float(args.sft_min_quality_score),
             "sft_filter_drop_short_answers": bool(args.sft_filter_drop_short_answers),
+            "sft_drop_synthetic_prompts": bool(args.sft_drop_synthetic_prompts),
             "sft_quality_filter_exempt_sources": sft_filter_exempt_sources,
             "sft_auto_balance_sources": bool(args.sft_auto_balance_sources),
             "sft_source_balance_strength": float(args.sft_source_balance_strength),
@@ -3852,7 +5408,14 @@ def main() -> None:
             "preference_beta_end": float(args.preference_beta_end),
             "preference_margin": float(args.preference_margin),
             "preference_margin_end": float(args.preference_margin_end),
+            "preference_label_smoothing": float(args.preference_label_smoothing),
+            "preference_xpo_clip": float(args.preference_xpo_clip),
             "preference_hardness_gamma": float(args.preference_hardness_gamma),
+            "preference_robust_alpha": float(args.preference_robust_alpha),
+            "preference_robust_eta": float(args.preference_robust_eta),
+            "preference_robust_clip": float(args.preference_robust_clip),
+            "preference_wpo_alpha": float(args.preference_wpo_alpha),
+            "preference_wpo_clip": float(args.preference_wpo_clip),
             "preference_reference_anchor_weight": float(args.preference_reference_anchor_weight),
             "preference_reference_anchor_batch_size": int(args.preference_reference_anchor_batch_size),
             "preference_lr": float(args.preference_lr),

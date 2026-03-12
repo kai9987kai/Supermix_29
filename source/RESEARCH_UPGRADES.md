@@ -188,3 +188,42 @@ Repo changes inspired by those papers:
 - Added a new preference-pair curation strategy, `innovation_mix`, that favors a balance of difficulty, reasoning structure, creativity, and dialogue continuity.
 - Added runtime follow-up-aware reranking plus a light refine pass for requests like “make it shorter,” “go deeper,” and “make it more creative.”
 - Added `context_mix_v3`, a smarter runtime context encoder that reads explicit conversation control tags, topic anchors, and prior-answer focus, and auto-upgrades old `context_v2` metadata paths at inference time.
+
+## March 2026: Recovery + Distillation Quality Upgrades
+
+Additional primary sources reviewed:
+
+1. PAD: Capturing Nuanced Preferences: Preference-Aligned Distillation for Small Language Models  
+   https://arxiv.org/abs/2502.14272
+2. UAPO: Adaptive Preference Optimization with Uncertainty-aware Utility Anchor  
+   https://arxiv.org/abs/2509.10515
+3. SPHERE: Self-Evolved Preference Optimization for Enhancing Mathematical Reasoning in Small Language Models  
+   https://arxiv.org/abs/2503.04813
+
+Repo changes inspired by those papers:
+
+- Added latest-checkpoint resume support in `source/qwen_supermix_pipeline.py` so long CPU runs can restart from the newest saved adapter while preserving SFT/preference step counters and LR schedules.
+- Added cached teacher-distillation reuse per output directory via `teacher_distill_pairs.jsonl`, allowing resumed runs to skip regenerating the same teacher pairs.
+- Upgraded Supermix teacher distillation from a single deterministic response to a lightweight best-of-N candidate search across a small temperature set, then kept the highest-scoring filtered response.
+- Added a CPU safety guard that disables SFT R-Drop automatically on CPU, because the extra forward pass was making training progress look stalled on this machine.
+
+## March 2026: Data Hygiene + Clean Eval Upgrades
+
+Additional primary sources reviewed:
+
+1. PAD: Capturing Nuanced Preferences: Preference-Aligned Distillation for Small Language Models  
+   https://arxiv.org/abs/2502.14272
+2. UAPO: Adaptive Preference Optimization with Uncertainty-aware Utility Anchor  
+   https://arxiv.org/abs/2509.10515
+3. Less is More: Improving LLM Alignment via Preference Data Selection  
+   https://arxiv.org/abs/2502.14560
+4. Towards Understanding Valuable Preference Data for LLM Post-Training  
+   https://arxiv.org/abs/2510.13212
+
+Repo changes inspired by those papers:
+
+- Tightened synthetic/template prompt detection around `*-setN` tags, `genre variant`, `debate framing`, and similar prompt-program artifacts so they can be capped or dropped more reliably.
+- Added `--sft_drop_synthetic_prompts` to keep templated synthetic prompts out of the SFT stage even when they survive coarse dataset loading.
+- Added `--eval_min_quality_score` and `--eval_drop_synthetic_prompts` so `eval_pairs.jsonl` and benchmark inputs are less contaminated by templated prompts and low-signal responses.
+- Upgraded teacher distillation with `--supermix_distill_min_gain`, so teacher responses are only kept when they improve on the original assistant answer by a configurable margin instead of merely clearing a fixed quality floor.
+- Updated the launcher recipe toward a cleaner v28 profile with stricter synthetic caps, stronger eval curation, and a nonzero preference reference anchor for better stability.

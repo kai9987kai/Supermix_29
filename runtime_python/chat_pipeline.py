@@ -32,12 +32,17 @@ FOLLOWUP_EDIT_HINT_RE = re.compile(
     r"\b(it|that|this|same|again|continue|deeper|expand|shorter|longer|rewrite|rephrase|refine|improve|make it)\b",
     re.I,
 )
+AMBIGUOUS_EDIT_RE = re.compile(
+    r"\b(make it better|improve it|fix this|change it|same but better|more like that|do that again)\b",
+    re.I,
+)
 SHORTEN_REQUEST_RE = re.compile(r"\b(shorter|brief|concise|trim|compress|tldr|one line|one sentence)\b", re.I)
 EXPAND_REQUEST_RE = re.compile(r"\b(deeper|expand|elaborate|more detail|longer|unpack|walk through)\b", re.I)
 REWRITE_REQUEST_RE = re.compile(r"\b(rewrite|rephrase|clearer|polish|fix the wording|paraphrase)\b", re.I)
 CONTINUE_REQUEST_RE = re.compile(r"\b(continue|go on|keep going|next part|what next)\b", re.I)
 REASONING_REQUEST_RE = re.compile(r"\b(step by step|why|how|derive|prove|debug|reason|analy[sz]e|tradeoff)\b", re.I)
 CREATIVE_REQUEST_RE = re.compile(r"\b(creative|story|metaphor|analogy|brainstorm|invent|vivid|novel)\b", re.I)
+NUMBER_RE = re.compile(r"\b-?\d+(?:\.\d+)?\b")
 LITERARY_HINT_RE = re.compile(
     r"\b(excerpt|novel|book|chapter|character|theme|tone|narrat|prose|literary|joyce|finnegans|portmanteau|modernist|allusion-heavy)\b",
     re.I,
@@ -77,6 +82,7 @@ CODE_HINT_RE = re.compile(
 MEDIA_IMAGE_PATH_RE = re.compile(r"(?:^|\|)\s*path=([^|\n]+)")
 MEDIA_VIDEO_PATH_RE = re.compile(r"(?:^|\|)\s*video=([^|\n]+)")
 MEDIA_3D_PATH_RE = re.compile(r"(?:^|\|)\s*model3d=([^|\n]+)")
+EXPLICIT_TARGET_RE = re.compile(r"`[^`]{2,}`|\"[^\"]{2,}\"|'[^']{2,}'")
 PROGRAMMING_HINT_RE = re.compile(
     r"```|`[^`]+`|\b(def|class|import|from|return|async|await|SELECT|INSERT|UPDATE|DELETE|function|const|let|var|public|private|try|except|catch|lambda|pip|npm|pytest|traceback|stack trace|segfault|nullpointer|keyerror|indexerror)\b",
     re.I,
@@ -269,6 +275,18 @@ SCRIPTURE_WORDS = {
     "romans",
     "revelation",
 }
+CLARIFICATION_PHRASES = (
+    "which part",
+    "what part",
+    "what exactly",
+    "what do you want me to",
+    "which answer",
+    "paste the text",
+    "share the text",
+    "what topic",
+    "what would you like",
+    "what are you referring to",
+)
 SCIENCE_WORDS = {
     "science",
     "scientific",
@@ -1257,9 +1275,11 @@ def featurize_context_mix_v3(context_text: str, dim: int = FEAT_DIM) -> torch.Te
     latest_user = ""
     latest_assistant = ""
     tags: List[str] = []
+    ambiguity_tags: List[str] = []
     topic_terms: List[str] = []
     assistant_focus: List[str] = []
     previous_request = ""
+    expected_act = ""
 
     for line in [ln.strip() for ln in raw.splitlines() if ln.strip()]:
         role, content = _split_role_line(line)
@@ -1267,6 +1287,10 @@ def featurize_context_mix_v3(context_text: str, dim: int = FEAT_DIM) -> torch.Te
         if role == "system":
             if low.startswith("conversation_tags="):
                 tags = [t.strip() for t in low.split("=", 1)[1].split(",") if t.strip()]
+            elif low.startswith("ambiguity_tags="):
+                ambiguity_tags = [t.strip() for t in low.split("=", 1)[1].split(",") if t.strip()]
+            elif low.startswith("expected_act="):
+                expected_act = content.split("=", 1)[1].strip().lower()
             elif low.startswith("topic_terms="):
                 topic_terms = [t.strip() for t in content.split("=", 1)[1].split(",") if t.strip()]
             elif low.startswith("last_assistant_focus="):
@@ -1281,12 +1305,18 @@ def featurize_context_mix_v3(context_text: str, dim: int = FEAT_DIM) -> torch.Te
 
     for tag in tags:
         acc += 0.035 * featurize_text(f"[ctx_tag] {tag}", dim=dim)
+    for tag in ambiguity_tags:
+        acc += 0.032 * featurize_text(f"[ctx_ambiguity] {tag}", dim=dim)
     if topic_terms:
         acc += 0.09 * featurize_text("[ctx_topic] " + " ".join(topic_terms[:8]), dim=dim)
     if assistant_focus:
         acc += 0.08 * featurize_text("[ctx_focus] " + " ".join(assistant_focus[:6]), dim=dim)
     if previous_request:
         acc += 0.06 * featurize_text("[ctx_prev_user] " + previous_request[:220], dim=dim)
+    if expected_act:
+        acc += 0.07 * featurize_text("[ctx_expected_act] " + expected_act, dim=dim)
+        if expected_act == "clarify":
+            acc += 0.08 * featurize_text("[clarify_request] resolve referent ask precise question", dim=dim)
 
     latest_user_low = latest_user.lower()
     if "followup" in tags and latest_assistant:
@@ -1365,11 +1395,85 @@ def _salient_terms(text: str, max_terms: int = 8) -> List[str]:
     return terms
 
 
+def _content_term_set(text: str, max_terms: int = 16) -> Set[str]:
+    return set(_salient_terms(text, max_terms=max_terms))
+
+
+def _recent_anchor_text(recent_assistant_messages: Sequence[str]) -> str:
+    for msg in reversed(recent_assistant_messages):
+        text = str(msg or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _ambiguity_profile(query_text: str, recent_assistant_messages: Sequence[str]) -> Dict[str, Any]:
+    query = str(query_text or "").strip()
+    lower = query.lower()
+    anchor = _recent_anchor_text(recent_assistant_messages)
+    content_terms = _content_term_set(query, max_terms=12)
+    explicit_target = bool(
+        EXPLICIT_TARGET_RE.search(query)
+        or "`" in query
+        or "\n" in query
+        or (":" in query and len(query) >= 20)
+    )
+    short_query = len(content_terms) <= 2 and len(query.split()) <= 5
+    vague_followup = bool(FOLLOWUP_EDIT_HINT_RE.search(lower)) and len(content_terms) <= 4
+    generic_edit = bool(AMBIGUOUS_EDIT_RE.search(lower))
+    conflict = bool(SHORTEN_REQUEST_RE.search(lower) and (EXPAND_REQUEST_RE.search(lower) or CONTINUE_REQUEST_RE.search(lower)))
+    missing_anchor = not bool(anchor) and (generic_edit or vague_followup or short_query)
+    needs_clarification = bool(conflict or (missing_anchor and not explicit_target))
+    tags: List[str] = []
+    if missing_anchor:
+        tags.append("missing_anchor")
+    if generic_edit:
+        tags.append("generic_edit")
+    if vague_followup:
+        tags.append("vague_followup")
+    if short_query:
+        tags.append("short_query")
+    if conflict:
+        tags.append("conflicting_constraints")
+    return {
+        "needs_clarification": needs_clarification,
+        "has_anchor": bool(anchor),
+        "conflict": conflict,
+        "explicit_target": explicit_target,
+        "tags": tags,
+    }
+
+
+def _expected_conversation_act(history: Sequence[Tuple[str, str]], user_text: str) -> str:
+    recent_assistant = [history[-1][1]] if history else []
+    ambiguity = _ambiguity_profile(user_text, recent_assistant)
+    if ambiguity["needs_clarification"]:
+        return "clarify"
+
+    profile = _followup_request_profile(user_text)
+    if profile["shorten"]:
+        return "shorten"
+    if profile["expand"]:
+        return "expand"
+    if profile["rewrite"]:
+        return "rewrite"
+    if profile["continue"]:
+        return "continue"
+    if profile["reasoning"]:
+        return "reason"
+    if profile["creative"]:
+        return "create"
+    return "answer"
+
+
 def _context_control_tags(history: Sequence[Tuple[str, str]], user_text: str) -> List[str]:
     query = (user_text or "").strip().lower()
     tags: List[str] = []
     if history and FOLLOWUP_EDIT_HINT_RE.search(query):
         tags.append("followup")
+    ambiguity = _ambiguity_profile(user_text, [history[-1][1]] if history else [])
+    if ambiguity["needs_clarification"]:
+        tags.append("clarify")
     if SHORTEN_REQUEST_RE.search(query):
         tags.append("shorten")
     if EXPAND_REQUEST_RE.search(query):
@@ -1396,6 +1500,12 @@ def build_context(history: Sequence[Tuple[str, str]], user_text: str, max_turns:
     tags = _context_control_tags(recent, user_text)
     if tags:
         parts.append(f"System: conversation_tags={','.join(tags)}")
+    ambiguity = _ambiguity_profile(user_text, [recent[-1][1]] if recent else [])
+    if ambiguity["tags"]:
+        parts.append(f"System: ambiguity_tags={','.join(ambiguity['tags'])}")
+    expected_act = _expected_conversation_act(recent, user_text)
+    if expected_act:
+        parts.append(f"System: expected_act={expected_act}")
     topic_terms = _salient_terms(" ".join([user_text] + [u for u, _a in recent[-2:]]))
     if topic_terms:
         parts.append(f"System: topic_terms={', '.join(topic_terms)}")
@@ -1855,6 +1965,126 @@ def _followup_request_profile(query_text: str) -> Dict[str, bool]:
     }
 
 
+def _clarification_question_for_query(query_text: str, recent_assistant_messages: Sequence[str]) -> str:
+    profile = _followup_request_profile(query_text)
+    anchor = _recent_anchor_text(recent_assistant_messages)
+    if profile["shorten"]:
+        return "What should I shorten? Paste the text or point me to the answer you want condensed."
+    if profile["expand"] or profile["continue"]:
+        return "What should I expand on? Point me to the topic or paste the text you want me to continue."
+    if profile["rewrite"]:
+        return "What should I rewrite? Paste the text or mention the answer you want rephrased."
+    if profile["creative"]:
+        return "What topic do you want me to make more creative?"
+    if profile["reasoning"]:
+        return "Which problem or claim do you want me to reason through step by step?"
+    if anchor:
+        focus_terms = ", ".join(_salient_terms(anchor, max_terms=4))
+        if focus_terms:
+            return f"Which part should I focus on: {focus_terms}?"
+    return "What are you referring to? A topic, question, or text snippet would let me answer precisely."
+
+
+def _clarification_response_signal(text: str) -> float:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return 0.0
+    score = 0.0
+    if "?" in raw:
+        score += 0.35
+    for phrase in CLARIFICATION_PHRASES:
+        if phrase in raw:
+            score += 0.18
+    if re.search(r"\b(paste|share|point me to|tell me which|show me)\b", raw):
+        score += 0.15
+    return min(1.0, score)
+
+
+def _query_view_texts(query_text: str, recent_assistant_messages: Sequence[str]) -> List[str]:
+    query = str(query_text or "").strip()
+    if not query:
+        return []
+    profile = _followup_request_profile(query)
+    ambiguity = _ambiguity_profile(query, recent_assistant_messages)
+    anchor = _recent_anchor_text(recent_assistant_messages)
+    views = [query]
+    if profile["followup"] and anchor:
+        views.append(f"{query}\nanchor: {anchor[:240]}")
+        focus_terms = _salient_terms(anchor, max_terms=6)
+        if focus_terms:
+            views.append(f"{query}\nfocus: {' '.join(focus_terms)}")
+    if profile["shorten"]:
+        views.append(f"{query}\nbrief concise shorter trim")
+    if profile["expand"] or profile["continue"]:
+        views.append(f"{query}\ndeeper elaborate explain more continue")
+    if profile["rewrite"]:
+        views.append(f"{query}\nrewrite rephrase clearer preserve meaning")
+    if profile["reasoning"]:
+        views.append(f"{query}\nstep by step because verify tradeoff")
+    if profile["creative"]:
+        views.append(f"{query}\nmetaphor analogy vivid fresh angle")
+    if ambiguity["needs_clarification"]:
+        views.append(f"{query}\nclarify exact referent or source text")
+    out: List[str] = []
+    seen: Set[str] = set()
+    for view in views:
+        key = " ".join(view.lower().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(view)
+    return out[:5]
+
+
+def _followup_constraint_score(
+    query_text: str,
+    candidate_text: str,
+    anchor_text: str,
+    reasoning_signal: float = 0.0,
+    creative_signal: float = 0.0,
+) -> float:
+    profile = _followup_request_profile(query_text)
+    if not profile["followup"] or not anchor_text or not candidate_text:
+        return 0.0
+
+    anchor_terms = _content_term_set(anchor_text, max_terms=14)
+    candidate_terms = _content_term_set(candidate_text, max_terms=14)
+    anchor_overlap = 0.0
+    if anchor_terms:
+        anchor_overlap = float(len(anchor_terms & candidate_terms)) / float(max(1, len(anchor_terms)))
+
+    anchor_numbers = set(NUMBER_RE.findall(anchor_text))
+    candidate_numbers = set(NUMBER_RE.findall(candidate_text))
+    number_overlap = 0.0
+    if anchor_numbers:
+        number_overlap = float(len(anchor_numbers & candidate_numbers)) / float(max(1, len(anchor_numbers)))
+
+    anchor_words = max(1.0, float(len(anchor_text.split())))
+    cand_words = max(1.0, float(len(candidate_text.split())))
+    len_ratio = cand_words / anchor_words
+    text_sim = float(SequenceMatcher(None, anchor_text.lower(), candidate_text.lower()).ratio())
+
+    score = 0.24 * anchor_overlap + 0.12 * number_overlap
+    if profile["shorten"]:
+        if len_ratio < 0.92:
+            score += 0.34 * min(1.0, (0.92 - len_ratio) / 0.52)
+        else:
+            score -= 0.10 * min(1.0, (len_ratio - 0.92) / 0.85)
+    if profile["expand"] or profile["continue"]:
+        if len_ratio > 1.05:
+            score += 0.24 * min(1.0, (len_ratio - 1.05) / 1.10)
+    if profile["rewrite"]:
+        if 0.22 <= text_sim <= 0.92:
+            score += 0.22
+        elif text_sim > 0.98:
+            score -= 0.12
+    if profile["reasoning"]:
+        score += 0.22 * float(reasoning_signal)
+    if profile["creative"]:
+        score += 0.20 * float(creative_signal)
+    return float(max(-0.30, min(1.25, score)))
+
+
 def _token_set(text: str, max_tokens: int = 96) -> Set[str]:
     out: Set[str] = set()
     for tok in _tokens(text, max_tokens=max_tokens):
@@ -1896,6 +2126,7 @@ def rank_response_candidates(
     if not candidates:
         return [], torch.zeros(0, dtype=torch.float32)
 
+    query_views = _query_view_texts(query_text, recent_assistant_messages)
     q = featurize_text(query_text)
     cand_resp_vecs = torch.tensor([row["vec"] for row in candidates], dtype=torch.float32)
     cand_ctx_vecs = torch.tensor(
@@ -1911,6 +2142,17 @@ def rank_response_candidates(
         sim_recent = torch.mm(cand_resp_vecs, recent_vecs.t()).max(dim=1).values
     else:
         sim_recent = torch.zeros(cand_resp_vecs.shape[0], dtype=torch.float32)
+    if len(query_views) >= 2:
+        view_vecs = torch.stack([featurize_text(view) for view in query_views], dim=0)
+        view_resp = torch.mm(cand_resp_vecs, view_vecs.t())
+        view_ctx = torch.mm(cand_ctx_vecs, view_vecs.t())
+        view_consistency_signal = _normalize_01(
+            0.55 * view_ctx.mean(dim=1)
+            + 0.45 * view_resp.mean(dim=1)
+            + 0.20 * torch.minimum(view_ctx.min(dim=1).values, view_resp.min(dim=1).values)
+        )
+    else:
+        view_consistency_signal = torch.zeros(cand_resp_vecs.shape[0], dtype=torch.float32)
 
     query_tokens = _token_set(query_text, max_tokens=64)
     overlap_vals: List[float] = []
@@ -2094,28 +2336,22 @@ def rank_response_candidates(
         for idx, row in enumerate(candidates):
             text = str(row.get("text", ""))
             score = 0.20 * float(anchor_signal[idx].item())
-            word_count = float(word_count_signal[idx].item())
-            text_sim = float(SequenceMatcher(None, anchor_text.lower(), text.lower()).ratio()) if text else 0.0
-            if followup_profile["shorten"]:
-                if word_count < 0.92 * anchor_word_count:
-                    score += 0.55
-                else:
-                    score -= 0.12
+            score += _followup_constraint_score(
+                query_text=query_text,
+                candidate_text=text,
+                anchor_text=anchor_text,
+                reasoning_signal=float(reasoning_depth_signal[idx].item()),
+                creative_signal=float(creative_signal[idx].item()),
+            )
             if followup_profile["expand"] or followup_profile["continue"]:
+                word_count = float(word_count_signal[idx].item())
                 if word_count > 1.05 * anchor_word_count:
-                    score += 0.35
-            if followup_profile["reasoning"]:
-                score += 0.28 * float(reasoning_depth_signal[idx].item())
-            if followup_profile["creative"]:
-                score += 0.28 * float(creative_signal[idx].item())
-            if followup_profile["rewrite"]:
-                if 0.18 <= text_sim <= 0.94:
-                    score += 0.22
-                elif text_sim > 0.98:
-                    score -= 0.12
+                    score += 0.08
             edit_vals.append(score)
         edit_match_signal = _normalize_01(torch.tensor(edit_vals, dtype=torch.float32))
-    followup_bonus = (0.10 * anchor_signal + 0.12 * edit_match_signal) if followup_profile["followup"] else 0.0
+    followup_bonus = (
+        0.10 * anchor_signal + 0.14 * edit_match_signal + 0.08 * view_consistency_signal
+    ) if followup_profile["followup"] else 0.0
 
     mode = infer_style_mode(query_text, requested_mode=style_mode)
     if mode == "creative":
@@ -2127,6 +2363,7 @@ def rank_response_candidates(
             + 0.14 * creative_signal
             + 0.07 * diversity_signal
             + 0.08 * domain_alignment
+            + 0.05 * view_consistency_signal
             + (0.05 * exact_lookup_signal if q_needs_exact_lookup else 0.0)
             + (0.04 * reference_style_signal if q_prefers_reference else 0.0)
             + (0.10 * reasoning_depth_signal if q_needs_reasoning else 0.04 * reasoning_depth_signal)
@@ -2144,6 +2381,7 @@ def rank_response_candidates(
             + 0.18 * concise_signal
             + 0.14 * bucket_bonus
             + 0.07 * domain_alignment
+            + 0.05 * view_consistency_signal
             + (0.12 * exact_lookup_signal if q_needs_exact_lookup else 0.02 * exact_lookup_signal)
             + (0.08 * reference_style_signal if q_prefers_reference else 0.0)
             + (0.08 * reasoning_depth_signal if q_needs_reasoning else 0.02 * reasoning_depth_signal)
@@ -2161,6 +2399,7 @@ def rank_response_candidates(
             + 0.14 * analytic_signal
             + 0.14 * bucket_bonus
             + 0.10 * domain_alignment
+            + 0.07 * view_consistency_signal
             + (0.10 * exact_lookup_signal if q_needs_exact_lookup else 0.03 * exact_lookup_signal)
             + (0.08 * reference_style_signal if q_prefers_reference else 0.0)
             + 0.12 * reasoning_depth_signal
@@ -2176,6 +2415,7 @@ def rank_response_candidates(
             + 0.10 * lex_sim
             + 0.18 * bucket_bonus
             + 0.08 * domain_alignment
+            + 0.06 * view_consistency_signal
             + (0.10 * exact_lookup_signal if q_needs_exact_lookup else 0.03 * exact_lookup_signal)
             + (0.06 * reference_style_signal if q_prefers_reference else 0.0)
             + (0.10 * reasoning_depth_signal if q_needs_reasoning else 0.04 * reasoning_depth_signal)
@@ -2356,12 +2596,17 @@ def pick_response(
     if not candidates:
         return "I do not have a good response for that yet."
 
+    ambiguity = _ambiguity_profile(query_text, recent_assistant_messages)
     ranked, scores = rank_response_candidates(
         candidates=candidates,
         query_text=query_text,
         recent_assistant_messages=recent_assistant_messages,
         style_mode=style_mode,
     )
+    if ambiguity["needs_clarification"] and (ambiguity["conflict"] or not ambiguity["has_anchor"]):
+        top_score = float(scores[ranked[0]].item()) if ranked else -1e9
+        if top_score < 0.55 or not ambiguity["has_anchor"]:
+            return _clarification_question_for_query(query_text, recent_assistant_messages)
     blocked = set(msg.strip() for msg in recent_assistant_messages[-2:] if msg.strip())
     filtered = [i for i in ranked if str(candidates[i].get("text", "")).strip() not in blocked]
     if not filtered:

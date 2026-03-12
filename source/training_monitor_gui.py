@@ -5,9 +5,13 @@ import os
 import re
 import subprocess
 import time
+import datetime
+import threading
+import winsound
+import psutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import ttk
@@ -16,12 +20,26 @@ if os.name == "nt":
     import ctypes
 
 
-TRAIN_STEP_RE = re.compile(r"\[train\] step=(\d+) loss=([0-9eE+\-.]+) lr=([0-9eE+\-.]+)")
+TRAIN_STEP_RE = re.compile(
+    r"\[train\] step=(\d+) loss=([0-9eE+\-.]+) lr=([0-9eE+\-.]+)(?: rdrop=([0-9eE+\-.]+))?"
+)
 PREF_STEP_RE = re.compile(
-    r"\[pref\] step=(\d+) loss=([0-9eE+\-.]+) lr=([0-9eE+\-.]+)(?: beta=([0-9eE+\-.]+) margin=([0-9eE+\-.]+))?"
+    r"\[pref\] step=(\d+) loss=([0-9eE+\-.]+) lr=([0-9eE+\-.]+)"
+    r"(?: beta=([0-9eE+\-.]+) margin=([0-9eE+\-.]+))?"
+    r"(?: wpo_std=([0-9eE+\-.]+))?"
 )
 PREF_PAIRS_RE = re.compile(r"\[pref\] pairs=(\d+)")
 CHECKPOINT_RE = re.compile(r"\[checkpoint\] saved stage=(sft|preference) step=(\d+)")
+RUNTIME_CONFIG_RE = re.compile(r"\[train\] runtime config: (.+)")
+MATCHED_LORA_CONFIG_RE = re.compile(r"\[train\] matched LoRA config to init adapter: (.+)")
+NEFTUNE_CONFIG_RE = re.compile(
+    r"\[train\] NEFTune config: sft_noise_alpha=([0-9eE+\-.]+) preference_noise_alpha=([0-9eE+\-.]+)"
+)
+LORA_PLUS_RE = re.compile(r"\[train\] LoRA\+ optimizer groups: ratio=([0-9eE+\-.]+) base_group=(\d+) fast_group=(\d+)")
+SOURCE_BALANCE_RE = re.compile(r"\[sft\] source balance factors: (.+)")
+PREF_BUILD_RE = re.compile(r"\[pref\] building preference pairs \(mode=(\S+)\)\.\.\.")
+PREF_OBJECTIVE_RE = re.compile(r"\[pref\] objective schedule: (.+)")
+PREF_REFERENCE_RE = re.compile(r"\[pref\] reference margins cached for (\d+) pairs")
 DATA_PROGRESS_RE = re.compile(
     r"\[data\] progress: pairs=(\d+)/(\d+) raw=(\d+) kept=(\d+) rate=([0-9eE+\-.]+)/s"
 )
@@ -29,7 +47,11 @@ DATA_QUALITY_RE = re.compile(
     r"\[data\] quality filter: raw=(\d+) kept=(\d+) empty=(\d+) placeholder=(\d+) filtered=(\d+) deduped=(\d+) "
     r"source_cap=(\d+) synthetic_cap=(\d+) prompt_cap=(\d+) cap_relax=(\d+)"
 )
+DATA_SPLIT_RE = re.compile(r"\[data\] train=(\d+) eval=(\d+)(?: \(raw_eval=(\d+)\))?")
 DATA_SYNTHETIC_RE = re.compile(r"\[data\] synthetic_kept=(\d+)/(\d+)")
+DISTILL_CONFIG_RE = re.compile(
+    r"\[distill\] config: target=(\d+) ratio=([0-9eE+\-.]+) max_seconds=(\S+) best_of=(\d+)(?: min_gain=([0-9eE+\-.]+))?"
+)
 DISTILL_PROGRESS_RE = re.compile(
     r"\[distill\] progress: visited=(\d+)/(\d+) generated=(\d+) rate=([0-9eE+\-.]+)/s"
 )
@@ -38,7 +60,17 @@ DISTILL_COMPLETE_RE = re.compile(
 )
 SFT_QUALITY_RE = re.compile(
     r"\[sft\] quality filter(?: fallback)?: threshold=([0-9eE+\-.]+) kept=(\d+) dropped_quality=(\d+) "
-    r"dropped_short=(\d+) exempt_sources=(\d+)"
+    r"dropped_short=(\d+)(?: dropped_synthetic=(\d+))? exempt_sources=(\d+)"
+)
+SFT_QUALITY_FALLBACK_RE = re.compile(
+    r"\[sft\] quality filter fallback: kept=(\d+) too small; using unfiltered set=(\d+)"
+)
+EVAL_FILTER_RE = re.compile(
+    r"\[eval\] quality filter: threshold=([0-9eE+\-.]+) kept=(\d+) dropped_quality=(\d+) dropped_synthetic=(\d+)"
+)
+EVAL_FILTER_FALLBACK_RE = re.compile(
+    r"\[eval\] quality filter fallback: kept=(\d+) after ranking top non-synthetic pairs "
+    r"\(threshold=([0-9eE+\-.]+), dropped_quality=(\d+), dropped_synthetic=(\d+)\)"
 )
 PREF_MINING_CONFIG_RE = re.compile(
     r"\[pref\] mining config: mode=(\S+) generation=(\S+) target_pairs=(\d+) candidates=(\d+) max_attempts=(\d+) "
@@ -64,6 +96,248 @@ RUN_CORE_RE = re.compile(r"^train_(.+?)_(\d{8}_\d{6})$")
 PROCESS_CMD_CACHE: Dict[int, Tuple[float, Optional[str]]] = {}
 PS1_TARGET_CACHE: Dict[str, Tuple[float, Optional[int], Optional[int], Optional[int], bool, bool]] = {}
 PROCESS_LIST_CACHE: Tuple[float, List["ProcessEntry"]] = (0.0, [])
+GPU_CACHE: Tuple[float, List[Dict[str, str]]] = (0.0, [])
+ACCELERATOR_CACHE: Tuple[float, Dict[str, Any]] = (0.0, {})
+TORCH_BACKEND_CACHE: Tuple[float, Dict[str, str]] = (0.0, {})
+
+
+def _module_available(module_name: str) -> bool:
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
+def _query_torch_backend_summary() -> Dict[str, str]:
+    global TORCH_BACKEND_CACHE
+    now = time.time()
+    if now - TORCH_BACKEND_CACHE[0] < 15.0:
+        return TORCH_BACKEND_CACHE[1]
+    summary = {
+        "torch": "unavailable",
+        "resolved": "unknown",
+        "cuda": "no",
+        "dml": "yes" if _module_available("torch_directml") else "no",
+        "npu": "yes" if _module_available("torch_npu") else "no",
+        "qnn": "yes" if _module_available("onnxruntime_qnn") else "no",
+    }
+    try:
+        import torch
+
+        summary["torch"] = str(torch.__version__)
+        resolved = "cpu"
+        if torch.cuda.is_available():
+            summary["cuda"] = "yes"
+            resolved = "cuda"
+        elif hasattr(torch, "npu") and torch.npu.is_available():  # type: ignore[attr-defined]
+            resolved = "npu"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():  # type: ignore[attr-defined]
+            resolved = "xpu"
+        elif summary["dml"] == "yes":
+            resolved = "dml-ready"
+        summary["resolved"] = resolved
+    except Exception:
+        pass
+    TORCH_BACKEND_CACHE = (now, summary)
+    return summary
+
+
+def _coerce_json_list(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def _run_powershell_json(script: str) -> Dict[str, Any]:
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return {}
+    if result.returncode != 0:
+        return {}
+    raw = str(result.stdout or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _parse_engine_instance(name: str) -> Tuple[str, str]:
+    text = str(name or "").lower()
+    phys_match = re.search(r"_phys_(\d+)", text)
+    eng_match = re.search(r"_eng_(\d+)", text)
+    engtype_match = re.search(r"_engtype_([^\\)]+)", text)
+    phys_key = f"phys_{phys_match.group(1)}" if phys_match else "phys_0"
+    eng_key = eng_match.group(1) if eng_match else "0"
+    eng_type = engtype_match.group(1).replace("_", " ").strip() if engtype_match else "unknown"
+    return phys_key, f"{eng_key}:{eng_type}"
+
+
+def _extract_phys_key(name: str) -> str:
+    text = str(name or "").lower()
+    phys_match = re.search(r"_phys_(\d+)", text)
+    return f"phys_{phys_match.group(1)}" if phys_match else "phys_0"
+
+
+def _summarize_windows_accelerators(payload: Dict[str, Any]) -> Dict[str, Any]:
+    adapters = _coerce_json_list(payload.get("adapters"))
+    engines = _coerce_json_list(payload.get("engines"))
+    memory = _coerce_json_list(payload.get("memory"))
+    npu_devices = _coerce_json_list(payload.get("npu"))
+
+    engine_util: Dict[str, Dict[str, float]] = {}
+    for row in engines:
+        phys_key, engine_key = _parse_engine_instance(str(row.get("Name", "")))
+        util = 0.0
+        try:
+            util = max(0.0, float(row.get("UtilizationPercentage", 0.0) or 0.0))
+        except Exception:
+            util = 0.0
+        phys_engines = engine_util.setdefault(phys_key, {})
+        phys_engines[engine_key] = max(util, phys_engines.get(engine_key, 0.0))
+
+    memory_by_phys: Dict[str, Dict[str, float]] = {}
+    for row in memory:
+        phys_key = _extract_phys_key(str(row.get("Name", "")))
+        try:
+            shared = float(row.get("SharedUsage", 0.0) or 0.0)
+        except Exception:
+            shared = 0.0
+        try:
+            committed = float(row.get("TotalCommitted", 0.0) or 0.0)
+        except Exception:
+            committed = 0.0
+        try:
+            dedicated = float(row.get("DedicatedUsage", 0.0) or 0.0)
+        except Exception:
+            dedicated = 0.0
+        current = memory_by_phys.setdefault(phys_key, {"shared": 0.0, "committed": 0.0, "dedicated": 0.0})
+        current["shared"] = max(current["shared"], shared)
+        current["committed"] = max(current["committed"], committed)
+        current["dedicated"] = max(current["dedicated"], dedicated)
+
+    gpu_rows: List[Dict[str, Any]] = []
+    adapter_names = [str(row.get("Name", "")).strip() for row in adapters if str(row.get("Name", "")).strip()]
+    phys_keys = sorted(set(engine_util.keys()) | set(memory_by_phys.keys()) | {f"phys_{idx}" for idx in range(len(adapter_names))})
+    for idx, phys_key in enumerate(phys_keys):
+        engines_for_phys = engine_util.get(phys_key, {})
+        total_util = max(engines_for_phys.values(), default=0.0)
+        compute_util = max(
+            (value for key, value in engines_for_phys.items() if key.endswith(":compute")),
+            default=0.0,
+        )
+        graphics_util = max(
+            (value for key, value in engines_for_phys.items() if key.endswith(":3d")),
+            default=0.0,
+        )
+        video_util = max(
+            (value for key, value in engines_for_phys.items() if "video" in key),
+            default=0.0,
+        )
+        mem = memory_by_phys.get(phys_key, {})
+        shared_gb = float(mem.get("shared", 0.0)) / (1024.0 ** 3)
+        committed_gb = float(mem.get("committed", 0.0)) / (1024.0 ** 3)
+        gpu_rows.append(
+            {
+                "name": adapter_names[idx] if idx < len(adapter_names) else phys_key.replace("_", " ").upper(),
+                "util": total_util,
+                "compute": compute_util,
+                "graphics": graphics_util,
+                "video": video_util,
+                "shared_gb": shared_gb,
+                "committed_gb": committed_gb,
+            }
+        )
+
+    npu_rows = []
+    for row in npu_devices:
+        name = str(row.get("Name", "")).strip()
+        if not name:
+            continue
+        npu_rows.append(
+            {
+                "name": name,
+                "manufacturer": str(row.get("Manufacturer", "")).strip(),
+                "status": str(row.get("Status", "")).strip() or "Unknown",
+            }
+        )
+
+    return {
+        "gpus": gpu_rows,
+        "npus": npu_rows,
+        "backend": _query_torch_backend_summary(),
+    }
+
+
+def _query_windows_accelerators() -> Dict[str, Any]:
+    global ACCELERATOR_CACHE
+    now = time.time()
+    if now - ACCELERATOR_CACHE[0] < 3.0:
+        return ACCELERATOR_CACHE[1]
+    if os.name != "nt":
+        ACCELERATOR_CACHE = (now, {})
+        return {}
+    script = """
+$payload = [ordered]@{
+  adapters = @(Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion)
+  memory = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory | Select-Object Name, DedicatedUsage, SharedUsage, TotalCommitted)
+  engines = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine | Select-Object Name, UtilizationPercentage)
+  npu = @(Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match 'NPU|Hexagon|Ryzen AI|Intel AI Boost|Neural|Hailo|Movidius' } | Select-Object Name, Manufacturer, Status)
+}
+$payload | ConvertTo-Json -Compress -Depth 5
+"""
+    payload = _run_powershell_json(script)
+    summary = _summarize_windows_accelerators(payload) if payload else {"backend": _query_torch_backend_summary(), "gpus": [], "npus": []}
+    ACCELERATOR_CACHE = (now, summary)
+    return summary
+
+
+def _query_gpu_stats() -> List[Dict[str, str]]:
+    """Query GPU stats via nvidia-smi. Returns a list of dicts per GPU."""
+    global GPU_CACHE
+    now = time.time()
+    if now - GPU_CACHE[0] < 3.0:  # cache for 3 seconds
+        return GPU_CACHE[1]
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            GPU_CACHE = (now, [])
+            return []
+        gpus = []
+        for line in result.stdout.strip().split("\n"):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 7:
+                gpus.append({
+                    "index": parts[0],
+                    "name": parts[1],
+                    "util": parts[2],
+                    "mem_used": parts[3],
+                    "mem_total": parts[4],
+                    "temp": parts[5],
+                    "power": parts[6],
+                })
+        GPU_CACHE = (now, gpus)
+        return gpus
+    except Exception:
+        GPU_CACHE = (now, [])
+        return []
+
 
 
 @dataclass(frozen=True)
@@ -90,8 +364,12 @@ class RunSnapshot:
     pref_pairs: int
     loss: Optional[float]
     lr: Optional[float]
+    rdrop: Optional[float]
+    wpo_std: Optional[float]
     beta: Optional[float]
     margin: Optional[float]
+    pref_objective: str
+    pref_reference_pairs: Optional[int]
     checkpoint_count: int
     last_checkpoint_stage: str
     last_checkpoint_step: int
@@ -110,6 +388,8 @@ class RunSnapshot:
     stage_progress_percent: Optional[float]
     stage_rate_label: str
     stage_eta_seconds: Optional[float]
+    cpu_percent: Optional[float]
+    ram_gb: Optional[float]
     out_size: int
     out_last_write_ts: float
     stale_minutes: float
@@ -121,8 +401,14 @@ class RunSnapshot:
     command_line: str
     launch_command: str
     health_summary: str
+    runtime_summary: str
+    adapter_summary: str
+    source_balance_summary: str
+    objective_summary: str
     data_summary: str
+    eval_summary: str
     sft_filter_summary: str
+    distill_config_summary: str
     distill_summary: str
     pref_mining_summary: str
     pref_selection_summary: str
@@ -138,20 +424,34 @@ class ParsedLog:
     pref_pairs: int = 0
     loss: Optional[float] = None
     lr: Optional[float] = None
+    rdrop: Optional[float] = None
+    wpo_std: Optional[float] = None
     beta: Optional[float] = None
     margin: Optional[float] = None
+    pref_objective: str = "-"
+    pref_reference_pairs: Optional[int] = None
     checkpoint_count: int = 0
     last_checkpoint_stage: str = "-"
     last_checkpoint_step: int = 0
+    runtime_summary: str = "-"
+    adapter_summary: str = "-"
+    source_balance_summary: str = "-"
+    objective_summary: str = "-"
     data_pairs_current: Optional[int] = None
     data_pairs_total: Optional[int] = None
     data_raw_count: Optional[int] = None
     data_kept_count: Optional[int] = None
     data_rate_per_sec: Optional[float] = None
+    train_pairs_count: Optional[int] = None
+    eval_pairs_count: Optional[int] = None
+    raw_eval_pairs_count: Optional[int] = None
     data_synthetic_kept: Optional[int] = None
     data_synthetic_total: Optional[int] = None
     data_summary: str = "-"
+    eval_summary: str = "-"
     sft_filter_summary: str = "-"
+    distill_target: Optional[int] = None
+    distill_config_summary: str = "-"
     distill_generated: Optional[int] = None
     distill_visited: Optional[int] = None
     distill_total: Optional[int] = None
@@ -726,6 +1026,9 @@ def _derive_stage_monitor_fields(parsed: ParsedLog) -> Tuple[str, Optional[float
             _eta_from_rate(current, total, parsed.distill_rate_per_sec),
         )
 
+    if stage == "distill" and parsed.distill_target is not None:
+        return (f"target={parsed.distill_target}", None, "-", None)
+
     if stage == "preference_mining":
         current = parsed.pref_mining_visited
         total = parsed.pref_mining_candidates
@@ -749,6 +1052,14 @@ def _derive_stage_monitor_fields(parsed: ParsedLog) -> Tuple[str, Optional[float
     if stage == "sft_filter":
         return ("quality filter", None, "-", None)
 
+    if stage == "eval":
+        kept = parsed.eval_pairs_count
+        raw = parsed.raw_eval_pairs_count if parsed.raw_eval_pairs_count is not None else kept
+        if kept is not None:
+            label = f"{kept}/{raw} eval" if raw is not None else f"{kept} eval"
+            return (label, _percent_complete(kept, raw), "-", None)
+        return (parsed.eval_summary if parsed.eval_summary != "-" else "benchmark", None, "-", None)
+
     if parsed.pref_pairs > 0:
         return (str(parsed.pref_pairs), None, "-", None)
 
@@ -767,6 +1078,7 @@ def _parse_log(
             parsed.sft_step = max(parsed.sft_step, int(m_train.group(1)))
             parsed.loss = float(m_train.group(2))
             parsed.lr = float(m_train.group(3))
+            parsed.rdrop = float(m_train.group(4)) if m_train.group(4) is not None else parsed.rdrop
         m_pref = PREF_STEP_RE.search(line)
         if m_pref:
             parsed.pref_step = max(parsed.pref_step, int(m_pref.group(1)))
@@ -774,6 +1086,7 @@ def _parse_log(
             parsed.lr = float(m_pref.group(3))
             parsed.beta = float(m_pref.group(4)) if m_pref.group(4) is not None else parsed.beta
             parsed.margin = float(m_pref.group(5)) if m_pref.group(5) is not None else parsed.margin
+            parsed.wpo_std = float(m_pref.group(6)) if m_pref.group(6) is not None else parsed.wpo_std
         m_pairs = PREF_PAIRS_RE.search(line)
         if m_pairs:
             parsed.pref_pairs = max(parsed.pref_pairs, int(m_pairs.group(1)))
@@ -782,6 +1095,39 @@ def _parse_log(
             parsed.checkpoint_count += 1
             parsed.last_checkpoint_stage = m_ckpt.group(1)
             parsed.last_checkpoint_step = int(m_ckpt.group(2))
+        m_runtime = RUNTIME_CONFIG_RE.search(line)
+        if m_runtime:
+            parsed.runtime_summary = m_runtime.group(1).strip()
+        m_lora_match = MATCHED_LORA_CONFIG_RE.search(line)
+        if m_lora_match:
+            payload = m_lora_match.group(1).strip()
+            parsed.adapter_summary = payload if parsed.adapter_summary == "-" else f"{parsed.adapter_summary} | {payload}"
+        m_neftune = NEFTUNE_CONFIG_RE.search(line)
+        if m_neftune:
+            payload = (
+                f"neftune_sft={float(m_neftune.group(1)):.3f} "
+                f"neftune_pref={float(m_neftune.group(2)):.3f}"
+            )
+            parsed.adapter_summary = payload if parsed.adapter_summary == "-" else f"{parsed.adapter_summary} | {payload}"
+        m_lora_plus = LORA_PLUS_RE.search(line)
+        if m_lora_plus:
+            payload = (
+                f"lora_plus_ratio={float(m_lora_plus.group(1)):.2f} "
+                f"base_group={int(m_lora_plus.group(2))} fast_group={int(m_lora_plus.group(3))}"
+            )
+            parsed.adapter_summary = payload if parsed.adapter_summary == "-" else f"{parsed.adapter_summary} | {payload}"
+        m_source_balance = SOURCE_BALANCE_RE.search(line)
+        if m_source_balance:
+            parsed.source_balance_summary = m_source_balance.group(1).strip()
+        m_pref_build = PREF_BUILD_RE.search(line)
+        if m_pref_build:
+            parsed.pref_objective = m_pref_build.group(1).strip()
+        m_pref_obj = PREF_OBJECTIVE_RE.search(line)
+        if m_pref_obj:
+            parsed.objective_summary = m_pref_obj.group(1).strip()
+        m_pref_ref = PREF_REFERENCE_RE.search(line)
+        if m_pref_ref:
+            parsed.pref_reference_pairs = int(m_pref_ref.group(1))
 
         m_data = DATA_PROGRESS_RE.search(line)
         if m_data:
@@ -793,6 +1139,18 @@ def _parse_log(
             parsed.data_summary = (
                 f"pairs={parsed.data_pairs_current}/{parsed.data_pairs_total} raw={parsed.data_raw_count} "
                 f"kept={parsed.data_kept_count} rate={parsed.data_rate_per_sec:.2f}/s"
+            )
+
+        m_data_split = DATA_SPLIT_RE.search(line)
+        if m_data_split:
+            parsed.train_pairs_count = int(m_data_split.group(1))
+            parsed.eval_pairs_count = int(m_data_split.group(2))
+            parsed.raw_eval_pairs_count = (
+                int(m_data_split.group(3)) if m_data_split.group(3) is not None else parsed.eval_pairs_count
+            )
+            parsed.eval_summary = (
+                f"train={parsed.train_pairs_count} eval={parsed.eval_pairs_count} "
+                f"raw_eval={parsed.raw_eval_pairs_count}"
             )
 
         m_data_quality = DATA_QUALITY_RE.search(line)
@@ -819,6 +1177,18 @@ def _parse_log(
             parsed.data_synthetic_total = int(m_data_synth.group(2))
             suffix = f" synthetic={parsed.data_synthetic_kept}/{parsed.data_synthetic_total}"
             parsed.data_summary = parsed.data_summary + suffix if parsed.data_summary != "-" else suffix.strip()
+
+        m_distill_cfg = DISTILL_CONFIG_RE.search(line)
+        if m_distill_cfg:
+            parsed.distill_target = int(m_distill_cfg.group(1))
+            ratio = float(m_distill_cfg.group(2))
+            max_seconds = m_distill_cfg.group(3)
+            best_of = int(m_distill_cfg.group(4))
+            min_gain = float(m_distill_cfg.group(5)) if m_distill_cfg.group(5) is not None else 0.0
+            parsed.distill_config_summary = (
+                f"target={parsed.distill_target} ratio={ratio:.3f} max_seconds={max_seconds} "
+                f"best_of={best_of} min_gain={min_gain:.3f}"
+            )
 
         m_distill = DISTILL_PROGRESS_RE.search(line)
         if m_distill:
@@ -848,11 +1218,52 @@ def _parse_log(
             kept = int(m_sft_quality.group(2))
             dropped_quality = int(m_sft_quality.group(3))
             dropped_short = int(m_sft_quality.group(4))
-            exempt_sources = int(m_sft_quality.group(5))
+            dropped_synthetic = int(m_sft_quality.group(5)) if m_sft_quality.group(5) is not None else None
+            exempt_sources = int(m_sft_quality.group(6))
             parsed.sft_filter_summary = (
                 f"threshold={threshold:.2f} kept={kept} dropped_quality={dropped_quality} "
-                f"dropped_short={dropped_short} exempt_sources={exempt_sources}"
+                f"dropped_short={dropped_short}"
             )
+            if dropped_synthetic is not None:
+                parsed.sft_filter_summary += f" dropped_synthetic={dropped_synthetic}"
+            parsed.sft_filter_summary += f" exempt_sources={exempt_sources}"
+
+        m_sft_fallback = SFT_QUALITY_FALLBACK_RE.search(line)
+        if m_sft_fallback:
+            kept = int(m_sft_fallback.group(1))
+            unfiltered = int(m_sft_fallback.group(2))
+            parsed.sft_filter_summary = f"fallback kept={kept} using_unfiltered={unfiltered}"
+
+        m_eval_filter = EVAL_FILTER_RE.search(line)
+        if m_eval_filter:
+            threshold = float(m_eval_filter.group(1))
+            kept = int(m_eval_filter.group(2))
+            dropped_quality = int(m_eval_filter.group(3))
+            dropped_synthetic = int(m_eval_filter.group(4))
+            raw_eval = kept + dropped_quality + dropped_synthetic
+            parsed.eval_pairs_count = kept
+            parsed.raw_eval_pairs_count = raw_eval
+            parsed.eval_summary = (
+                f"threshold={threshold:.2f} kept={kept}/{raw_eval} "
+                f"dropped_quality={dropped_quality} dropped_synthetic={dropped_synthetic}"
+            )
+
+        m_eval_fallback = EVAL_FILTER_FALLBACK_RE.search(line)
+        if m_eval_fallback:
+            kept = int(m_eval_fallback.group(1))
+            threshold = float(m_eval_fallback.group(2))
+            dropped_quality = int(m_eval_fallback.group(3))
+            dropped_synthetic = int(m_eval_fallback.group(4))
+            raw_eval = kept + dropped_quality + dropped_synthetic
+            parsed.eval_pairs_count = kept
+            parsed.raw_eval_pairs_count = raw_eval
+            parsed.eval_summary = (
+                f"fallback threshold={threshold:.2f} kept={kept}/{raw_eval} "
+                f"dropped_quality={dropped_quality} dropped_synthetic={dropped_synthetic}"
+            )
+
+        if line.startswith("[eval] skipped"):
+            parsed.eval_summary = line[len("[eval]") :].strip()
 
         m_pref_cfg = PREF_MINING_CONFIG_RE.search(line)
         if m_pref_cfg:
@@ -1037,14 +1448,23 @@ def collect_run_snapshots(root_dir: Path, stale_minutes_threshold: float) -> Lis
             parsed
         )
 
-        if pid_alive:
+        cpu_percent = None
+        ram_gb = None
+        if parsed.stage == "done":
+            status = "finished"
+        elif pid_alive:
             status = "running"
             if stale_mins >= float(stale_minutes_threshold):
                 status = "stalled"
+            try:
+                if pid is not None:
+                    p = psutil.Process(pid)
+                    cpu_percent = p.cpu_percent(interval=None)
+                    ram_gb = p.memory_info().rss / (1024 ** 3)
+            except Exception:
+                pass
         else:
-            if parsed.stage == "done":
-                status = "finished"
-            elif out_size > 0:
+            if out_size > 0:
                 status = "stopped"
             else:
                 status = "unknown"
@@ -1076,8 +1496,12 @@ def collect_run_snapshots(root_dir: Path, stale_minutes_threshold: float) -> Lis
                 pref_pairs=parsed.pref_pairs,
                 loss=parsed.loss,
                 lr=parsed.lr,
+                rdrop=parsed.rdrop,
+                wpo_std=parsed.wpo_std,
                 beta=parsed.beta,
                 margin=parsed.margin,
+                pref_objective=parsed.pref_objective,
+                pref_reference_pairs=parsed.pref_reference_pairs,
                 checkpoint_count=parsed.checkpoint_count,
                 last_checkpoint_stage=parsed.last_checkpoint_stage,
                 last_checkpoint_step=parsed.last_checkpoint_step,
@@ -1096,6 +1520,8 @@ def collect_run_snapshots(root_dir: Path, stale_minutes_threshold: float) -> Lis
                 stage_progress_percent=stage_progress_percent,
                 stage_rate_label=stage_rate_label,
                 stage_eta_seconds=stage_eta_seconds,
+                cpu_percent=cpu_percent,
+                ram_gb=ram_gb,
                 out_size=out_size,
                 out_last_write_ts=out_mtime,
                 stale_minutes=stale_mins,
@@ -1107,8 +1533,14 @@ def collect_run_snapshots(root_dir: Path, stale_minutes_threshold: float) -> Lis
                 command_line=command_line,
                 launch_command=launch_command,
                 health_summary=health_summary,
+                runtime_summary=parsed.runtime_summary,
+                adapter_summary=parsed.adapter_summary,
+                source_balance_summary=parsed.source_balance_summary,
+                objective_summary=parsed.objective_summary,
                 data_summary=parsed.data_summary,
+                eval_summary=parsed.eval_summary,
                 sft_filter_summary=parsed.sft_filter_summary,
+                distill_config_summary=parsed.distill_config_summary,
                 distill_summary=parsed.distill_summary,
                 pref_mining_summary=parsed.pref_mining_summary,
                 pref_selection_summary=parsed.pref_selection_summary,
@@ -1133,10 +1565,16 @@ def _fmt_eta(seconds: Optional[float]) -> str:
     hours, rem = divmod(rem, 3600)
     mins, _ = divmod(rem, 60)
     if days > 0:
-        return f"{days}d {hours}h {mins}m"
-    if hours > 0:
-        return f"{hours}h {mins}m"
-    return f"{mins}m"
+        dur = f"{days}d {hours}h {mins}m"
+    elif hours > 0:
+        dur = f"{hours}h {mins}m"
+    else:
+        dur = f"{mins}m"
+    eta_time = datetime.datetime.now() + datetime.timedelta(seconds=seconds)
+    time_str = eta_time.strftime("%I:%M %p").lstrip("0")
+    if days > 0:
+        time_str += f" (+{days}d)"
+    return f"{dur} ({time_str})"
 
 
 def _summarize_err_tail(err_lines: Sequence[str]) -> Tuple[str, str]:
@@ -1340,6 +1778,67 @@ def _compute_display_progress_percent(snap: RunSnapshot) -> Optional[float]:
     return snap.stage_progress_percent
 
 
+def _resolve_canvas_size(
+    width: int,
+    height: int,
+    default_width: int,
+    default_height: int,
+    min_width: int = 120,
+    min_height: int = 48,
+) -> Tuple[int, int]:
+    try:
+        w = int(width)
+    except Exception:
+        w = 0
+    try:
+        h = int(height)
+    except Exception:
+        h = 0
+    if w < int(min_width):
+        w = int(default_width)
+    if h < int(min_height):
+        h = int(default_height)
+    return max(int(min_width), w), max(int(min_height), h)
+
+
+def _history_window_seconds(window_key: str) -> float:
+    key = str(window_key or "").strip().lower()
+    return {
+        "10m": 10.0 * 60.0,
+        "60m": 60.0 * 60.0,
+        "6h": 6.0 * 3600.0,
+    }.get(key, 60.0 * 60.0)
+
+
+def _phase_breakdown_rows(snap: RunSnapshot) -> List[Tuple[str, float, float, bool]]:
+    rows: List[Tuple[str, float, float, bool]] = []
+    for phase, weight in _phase_weight_plan(snap):
+        frac = _phase_completion(snap, phase)
+        rows.append(
+            (
+                phase,
+                float(weight),
+                0.0 if frac is None else max(0.0, min(1.0, float(frac))),
+                str(snap.stage or "").strip().lower() == str(phase or "").strip().lower(),
+            )
+        )
+    return rows
+
+
+def _runtime_device_value(snap: RunSnapshot) -> str:
+    runtime = str(snap.runtime_summary or "").strip().lower()
+    match = re.search(r"\bresolved=([a-z0-9_:+.-]+)", runtime)
+    if match:
+        return match.group(1)
+    match = re.search(r"\bdevice=([a-z0-9_:+.-]+)", runtime)
+    if match:
+        value = match.group(1)
+        if value == "privateuseone:0":
+            return "dml"
+        return value
+    return "-"
+
+
 class TrainingMonitorApp:
     def __init__(self, root: tk.Tk, root_dir: Path, refresh_seconds: float, stale_minutes: float) -> None:
         self.root = root
@@ -1362,42 +1861,100 @@ class TrainingMonitorApp:
         self.fleet_progress_var = tk.StringVar(value="Fleet Progress: -")
         self.fleet_eta_var = tk.StringVar(value="Fleet ETA: -")
         self.trend_metric_var = tk.StringVar(value="progress")
+        self.trend_window_var = tk.StringVar(value="60m")
         self.current_snapshots: Dict[str, RunSnapshot] = {}
         self.progress_history: Dict[str, List[Tuple[float, float]]] = {}
         self.display_progress_history: Dict[str, List[Tuple[float, float]]] = {}
         self.loss_history: Dict[str, List[Tuple[float, float]]] = {}
         self.lr_history: Dict[str, List[Tuple[float, float]]] = {}
+        self.rdrop_history: Dict[str, List[Tuple[float, float]]] = {}
+        self.wpo_std_history: Dict[str, List[Tuple[float, float]]] = {}
         self.rate_history: Dict[str, List[Tuple[float, float]]] = {}
+        self.cpu_history: Dict[str, List[Tuple[float, float]]] = {}
+        self.ram_history: Dict[str, List[Tuple[float, float]]] = {}
+        self.stale_history: Dict[str, List[Tuple[float, float]]] = {}
         self.sort_col = "updated"
         self.sort_reverse = True
+        self.gpu_var = tk.StringVar(value="GPU: scanning...")
+        self._last_error_alert_ts = 0.0
+        self._notification_enabled_var = tk.BooleanVar(value=True)
 
         self._build_ui()
         self._load_settings()
         self.refresh()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._schedule_refresh()
+        self._bind_keyboard_shortcuts()
+        self._start_gpu_polling()
 
     def _build_ui(self) -> None:
-        top = ttk.Frame(self.root, padding=10)
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        
+        bg_color = "#1e1e1e"
+        fg_color = "#d4d4d4"
+        panel_bg = "#252526"
+        input_bg = "#3c3c3c"
+        select_bg = "#094771"
+        border_color = "#454545"
+        
+        self.root.configure(bg=bg_color)
+        
+        style.configure(".", background=bg_color, foreground=fg_color, fieldbackground=input_bg, insertcolor=fg_color, bordercolor=border_color, lightcolor=border_color, darkcolor=border_color)
+        style.configure("TFrame", background=bg_color)
+        style.configure("TLabel", background=bg_color, foreground=fg_color)
+        style.configure("TButton", background=panel_bg, foreground=fg_color, bordercolor=border_color)
+        style.map("TButton", background=[("active", "#333333")])
+        style.configure("TCheckbutton", background=bg_color, foreground=fg_color)
+        style.map("TCheckbutton", background=[("active", bg_color)])
+        
+        style.configure("Treeview", background=panel_bg, foreground=fg_color, fieldbackground=panel_bg, bordercolor=border_color)
+        style.map("Treeview", background=[("selected", select_bg)], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background="#333333", foreground=fg_color, bordercolor=border_color)
+        style.map("Treeview.Heading", background=[("active", "#3e3e42")])
+        
+        top = ttk.Frame(self.root, padding=0)
         top.pack(fill=tk.X)
 
-        ttk.Label(top, text="Workspace").pack(side=tk.LEFT)
-        self.root_entry = ttk.Entry(top, width=62)
+        # ── Branded header banner ──
+        header = tk.Canvas(top, height=48, bg="#1a1a2e", highlightthickness=0)
+        header.pack(fill=tk.X)
+        header.update_idletasks()
+        hw = max(header.winfo_width(), 1520)
+        # Draw gradient
+        for i in range(hw):
+            r = int(26 + (16 * i / hw))
+            g = int(26 + (40 * i / hw))
+            b = int(46 + (60 * i / hw))
+            color = f"#{r:02x}{g:02x}{b:02x}"
+            header.create_line(i, 0, i, 48, fill=color)
+        header.create_text(20, 24, anchor="w", text="⚡ SUPERMIX TRAINING MONITOR",
+                           fill="#00d4ff", font=("Segoe UI", 16, "bold"))
+        header.create_text(hw - 20, 24, anchor="e", text="v29 • Paper Fusion Architecture",
+                           fill="#6a9fb5", font=("Segoe UI", 10))
+
+        # ── Controls row ──
+        controls = ttk.Frame(self.root, padding=10)
+        controls.pack(fill=tk.X)
+
+        ttk.Label(controls, text="Workspace").pack(side=tk.LEFT)
+        self.root_entry = ttk.Entry(controls, width=50)
         self.root_entry.insert(0, str(self.root_dir))
         self.root_entry.pack(side=tk.LEFT, padx=(8, 10))
 
-        ttk.Label(top, text="Stall mins").pack(side=tk.LEFT)
-        self.stale_entry = ttk.Entry(top, width=7)
+        ttk.Label(controls, text="Stall mins").pack(side=tk.LEFT)
+        self.stale_entry = ttk.Entry(controls, width=7)
         self.stale_entry.insert(0, str(int(self.stale_minutes)))
         self.stale_entry.pack(side=tk.LEFT, padx=(8, 10))
 
-        ttk.Label(top, text="Refresh s").pack(side=tk.LEFT)
-        self.refresh_entry = ttk.Entry(top, width=7)
+        ttk.Label(controls, text="Refresh s").pack(side=tk.LEFT)
+        self.refresh_entry = ttk.Entry(controls, width=7)
         self.refresh_entry.insert(0, str(int(self.refresh_seconds)))
         self.refresh_entry.pack(side=tk.LEFT, padx=(8, 10))
 
-        ttk.Checkbutton(top, text="Auto", variable=self.auto_refresh_var).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(top, text="Refresh Now", command=self.refresh).pack(side=tk.LEFT)
+        ttk.Checkbutton(controls, text="Auto", variable=self.auto_refresh_var).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Checkbutton(controls, text="🔔 Alerts", variable=self._notification_enabled_var).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="⟳ Refresh (F5)", command=self.refresh).pack(side=tk.LEFT)
 
         filter_row = ttk.Frame(self.root, padding=(10, 0, 10, 8))
         filter_row.pack(fill=tk.X)
@@ -1450,22 +2007,70 @@ class TrainingMonitorApp:
         self.fleet_progress_bar = ttk.Progressbar(fleet, mode="determinate", maximum=100, length=420)
         self.fleet_progress_bar.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(fleet, textvariable=self.fleet_progress_var).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Label(fleet, textvariable=self.fleet_eta_var).pack(side=tk.LEFT)
+        ttk.Label(fleet, textvariable=self.fleet_eta_var).pack(side=tk.LEFT, padx=(0, 20))
 
-        trend = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        # ── GPU Stats Row ──
+        gpu_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        gpu_frame.pack(fill=tk.X)
+        self.gpu_canvas = tk.Canvas(
+            gpu_frame,
+            width=620,
+            height=84,
+            background=panel_bg,
+            highlightthickness=1,
+            highlightbackground=border_color,
+        )
+        self.gpu_canvas.pack(fill=tk.X, expand=True)
+
+        trend = ttk.Frame(self.root, padding=(10, 0, 10, 6))
         trend.pack(fill=tk.X)
-        ttk.Label(trend, text="Selected Run Trend (last hour):").pack(side=tk.LEFT, padx=(0, 8))
+        trend_controls = ttk.Frame(trend)
+        trend_controls.pack(fill=tk.X)
+        ttk.Label(trend_controls, text="Selected Run Trend:").pack(side=tk.LEFT, padx=(0, 8))
         self.trend_metric_combo = ttk.Combobox(
-            trend,
+            trend_controls,
             width=12,
             state="readonly",
-            values=("progress", "loss", "lr", "rate"),
+            values=("progress", "loss", "lr", "rdrop", "wpo_std", "rate", "cpu", "ram", "stale"),
             textvariable=self.trend_metric_var,
         )
         self.trend_metric_combo.pack(side=tk.LEFT, padx=(0, 10))
         self.trend_metric_combo.bind("<<ComboboxSelected>>", lambda _e: self._draw_selected_trend(self._selected_run_name()))
-        self.trend_canvas = tk.Canvas(trend, width=620, height=80, background="#ffffff", highlightthickness=1)
-        self.trend_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(trend_controls, text="Window").pack(side=tk.LEFT, padx=(0, 6))
+        self.trend_window_combo = ttk.Combobox(
+            trend_controls,
+            width=6,
+            state="readonly",
+            values=("10m", "60m", "6h"),
+            textvariable=self.trend_window_var,
+        )
+        self.trend_window_combo.pack(side=tk.LEFT, padx=(0, 10))
+        self.trend_window_combo.bind("<<ComboboxSelected>>", lambda _e: self._draw_selected_trend(self._selected_run_name()))
+
+        self.trend_canvas = tk.Canvas(
+            trend,
+            width=620,
+            height=110,
+            background=panel_bg,
+            highlightthickness=1,
+            highlightbackground=border_color,
+        )
+        self.trend_canvas.pack(fill=tk.X, expand=True, pady=(6, 0))
+        self.trend_canvas.bind("<Configure>", lambda _e: self._draw_selected_trend(self._selected_run_name()))
+
+        phase = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        phase.pack(fill=tk.X)
+        ttk.Label(phase, text="Phase Breakdown:").pack(side=tk.LEFT, padx=(0, 8))
+        self.phase_canvas = tk.Canvas(
+            phase,
+            width=620,
+            height=44,
+            background=panel_bg,
+            highlightthickness=1,
+            highlightbackground=border_color,
+        )
+        self.phase_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.phase_canvas.bind("<Configure>", lambda _e: self._draw_phase_breakdown(self._selected_snapshot()))
 
         table_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         table_frame.pack(fill=tk.BOTH, expand=True)
@@ -1474,6 +2079,7 @@ class TrainingMonitorApp:
             "run",
             "status",
             "stage",
+            "device",
             "sft",
             "pref",
             "pairs",
@@ -1488,26 +2094,29 @@ class TrainingMonitorApp:
             "stale",
             "updated",
             "pid",
+            "cpu_ram",
         )
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=16)
         for col, width in (
-            ("run", 290),
+            ("run", 260),
             ("status", 90),
             ("stage", 130),
+            ("device", 90),
             ("sft", 80),
             ("pref", 80),
             ("pairs", 120),
             ("loss", 90),
             ("lr", 95),
             ("prog", 90),
-            ("eta", 90),
+            ("eta", 130),
             ("eta_conf", 90),
-            ("ckpt_eta", 90),
+            ("ckpt_eta", 130),
             ("rate", 95),
             ("err", 85),
             ("stale", 75),
             ("updated", 165),
             ("pid", 80),
+            ("cpu_ram", 100),
         ):
             heading = "WORK" if col == "pairs" else col.upper()
             self.tree.heading(col, text=heading, command=lambda c=col: self._sort_by_column(c))
@@ -1522,7 +2131,7 @@ class TrainingMonitorApp:
 
         detail = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         detail.pack(fill=tk.BOTH, expand=True)
-        self.detail_text = tk.Text(detail, wrap=tk.NONE, height=22, font=("Consolas", 10))
+        self.detail_text = tk.Text(detail, wrap=tk.NONE, height=22, font=("Consolas", 10), bg=panel_bg, fg=fg_color, insertbackground=fg_color, highlightthickness=0, borderwidth=1, relief="solid")
         self.detail_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         detail_scroll = ttk.Scrollbar(detail, orient=tk.VERTICAL, command=self.detail_text.yview)
         self.detail_text.configure(yscrollcommand=detail_scroll.set)
@@ -1532,12 +2141,173 @@ class TrainingMonitorApp:
         bottom.pack(fill=tk.X)
         ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT)
 
-        self.tree.tag_configure("running", background="#e9f7ef")
-        self.tree.tag_configure("stalled", background="#fdecea")
-        self.tree.tag_configure("finished", background="#eef4fd")
-        self.tree.tag_configure("stopped", background="#fff8e6")
-        self.tree.tag_configure("err_error", foreground="#9b1c1c")
-        self.tree.tag_configure("err_warn", foreground="#8a6d3b")
+        self.tree.tag_configure("running", background="#0e4020", foreground="#d4d4d4")
+        self.tree.tag_configure("stalled", background="#5b1b15", foreground="#d4d4d4")
+        self.tree.tag_configure("finished", background="#153655", foreground="#d4d4d4")
+        self.tree.tag_configure("stopped", background="#4a3e14", foreground="#d4d4d4")
+        self.tree.tag_configure("err_error", foreground="#f14c4c")
+        self.tree.tag_configure("err_warn", foreground="#cca700")
+
+    def _bind_keyboard_shortcuts(self) -> None:
+        self.root.bind("<F5>", lambda _e: self.refresh())
+        self.root.bind("<Control-f>", lambda _e: self._focus_search())
+        self.root.bind("<Control-l>", lambda _e: self._open_selected_out_log())
+        self.root.bind("<Control-e>", lambda _e: self._open_selected_err_log())
+        self.root.bind("<Control-d>", lambda _e: self._open_selected_run_dir())
+        self.root.bind("<Control-n>", lambda _e: self._select_next_issue())
+
+    def _focus_search(self) -> None:
+        self.search_entry.focus_set()
+        self.search_entry.select_range(0, tk.END)
+
+    def _start_gpu_polling(self) -> None:
+        def _poll():
+            while True:
+                try:
+                    gpus = _query_gpu_stats()
+                    windows_summary = _query_windows_accelerators()
+                    self._draw_accelerator_stats(gpus, windows_summary)
+                except Exception:
+                    pass
+                time.sleep(3.0)
+        t = threading.Thread(target=_poll, daemon=True)
+        t.start()
+
+    def _draw_accelerator_stats(self, gpus: List[Dict[str, str]], windows_summary: Dict[str, Any]) -> None:
+        def _update():
+            self.gpu_canvas.delete("all")
+            backend = windows_summary.get("backend", {}) if isinstance(windows_summary, dict) else {}
+            backend_text = (
+                f"Torch {backend.get('torch', 'unavailable')} | active={backend.get('resolved', 'unknown')} "
+                f"| CUDA {backend.get('cuda', 'no')} | DML pkg {backend.get('dml', 'no')} "
+                f"| torch_npu {backend.get('npu', 'no')} | ORT QNN {backend.get('qnn', 'no')}"
+            )
+            self.gpu_canvas.create_text(
+                10,
+                12,
+                anchor="w",
+                text=backend_text,
+                fill="#9da5b4",
+                font=("Consolas", 9),
+            )
+
+            y_mid = 34
+            bar_w = 116
+            bar_h = 12
+            rows_drawn = 1
+
+            def _draw_row(label: str, util: float, detail: str) -> None:
+                nonlocal y_mid, rows_drawn
+                fill_color = "#00cc66" if util < 70 else ("#ffaa00" if util < 90 else "#ff4444")
+                self.gpu_canvas.create_rectangle(
+                    10,
+                    y_mid - bar_h // 2,
+                    10 + bar_w,
+                    y_mid + bar_h // 2,
+                    fill="#2d2d30",
+                    outline="#454545",
+                )
+                fill_w = int(bar_w * max(0.0, min(100.0, util)) / 100.0)
+                if fill_w > 0:
+                    self.gpu_canvas.create_rectangle(
+                        10,
+                        y_mid - bar_h // 2,
+                        10 + fill_w,
+                        y_mid + bar_h // 2,
+                        fill=fill_color,
+                        outline="",
+                    )
+                self.gpu_canvas.create_text(
+                    10 + bar_w + 8,
+                    y_mid,
+                    anchor="w",
+                    text=f"{label} {util:.0f}% | {detail}",
+                    fill="#d4d4d4",
+                    font=("Consolas", 9),
+                )
+                y_mid += 20
+                rows_drawn += 1
+
+            if gpus:
+                for gpu in gpus:
+                    try:
+                        util = float(gpu.get("util", "0") or 0)
+                        mem_used = float(gpu.get("mem_used", "0") or 0)
+                        mem_total = max(1.0, float(gpu.get("mem_total", "1") or 1))
+                        temp = gpu.get("temp", "?")
+                        power = gpu.get("power", "?")
+                        mem_pct = mem_used / mem_total * 100.0
+                        _draw_row(
+                            label=f"GPU{gpu.get('index', '?')}",
+                            util=util,
+                            detail=(
+                                f"{gpu.get('name', 'NVIDIA')} | VRAM {mem_used:.0f}/{mem_total:.0f}MB ({mem_pct:.0f}%) "
+                                f"| {temp}C | {power}W"
+                            ),
+                        )
+                    except Exception:
+                        continue
+            else:
+                gpu_rows = windows_summary.get("gpus", []) if isinstance(windows_summary, dict) else []
+                if gpu_rows:
+                    for idx, row in enumerate(gpu_rows):
+                        util = float(row.get("util", 0.0) or 0.0)
+                        detail = (
+                            f"{row.get('name', f'GPU {idx}')} | compute {float(row.get('compute', 0.0) or 0.0):.0f}% "
+                            f"| 3d {float(row.get('graphics', 0.0) or 0.0):.0f}% "
+                            f"| video {float(row.get('video', 0.0) or 0.0):.0f}% "
+                            f"| shared {float(row.get('shared_gb', 0.0) or 0.0):.2f}G"
+                        )
+                        committed_gb = float(row.get("committed_gb", 0.0) or 0.0)
+                        if committed_gb > 0.0:
+                            detail += f" / commit {committed_gb:.2f}G"
+                        _draw_row(label=f"GPU{idx}", util=util, detail=detail)
+                else:
+                    self.gpu_canvas.create_text(
+                        10,
+                        y_mid,
+                        anchor="w",
+                        text="GPU telemetry unavailable (nvidia-smi absent and Windows counters unavailable)",
+                        fill="#777777",
+                        font=("Consolas", 9),
+                    )
+                    y_mid += 20
+                    rows_drawn += 1
+
+            npu_rows = windows_summary.get("npus", []) if isinstance(windows_summary, dict) else []
+            for idx, row in enumerate(npu_rows):
+                manufacturer = str(row.get("manufacturer", "")).strip()
+                status = str(row.get("status", "Unknown")).strip()
+                detail = f"{row.get('name', f'NPU {idx}')}"
+                if manufacturer:
+                    detail += f" | {manufacturer}"
+                detail += f" | status {status} | live activity counter unavailable"
+                _draw_row(label=f"NPU{idx}", util=0.0, detail=detail)
+
+            target_height = max(44, 14 + rows_drawn * 20)
+            self.gpu_canvas.configure(height=target_height)
+        try:
+            self.root.after(0, _update)
+        except Exception:
+            pass
+
+    def _check_and_alert(self, snapshots: Sequence[RunSnapshot]) -> None:
+        if not self._notification_enabled_var.get():
+            return
+        now = time.time()
+        if now - self._last_error_alert_ts < 30.0:
+            return
+        for snap in snapshots:
+            if snap.status == "stalled" or snap.err_signal == "error":
+                self._last_error_alert_ts = now
+                try:
+                    threading.Thread(
+                        target=lambda: winsound.MessageBeep(winsound.MB_ICONEXCLAMATION),
+                        daemon=True
+                    ).start()
+                except Exception:
+                    pass
+                return
 
     def _schedule_refresh(self) -> None:
         self.root.after(int(self.refresh_seconds * 1000), self._tick)
@@ -1604,8 +2374,11 @@ class TrainingMonitorApp:
             self.search_var.set(str(raw.get("search", "")))
             self.auto_refresh_var.set(bool(raw.get("auto_refresh", True)))
             trend_metric = str(raw.get("trend_metric", "progress")).strip().lower()
-            if trend_metric in {"progress", "loss", "lr", "rate"}:
+            if trend_metric in {"progress", "loss", "lr", "rdrop", "wpo_std", "rate", "cpu", "ram", "stale"}:
                 self.trend_metric_var.set(trend_metric)
+            trend_window = str(raw.get("trend_window", "60m")).strip().lower()
+            if trend_window in {"10m", "60m", "6h"}:
+                self.trend_window_var.set(trend_window)
 
             sort_col = str(raw.get("sort_col", self.sort_col))
             if sort_col:
@@ -1641,6 +2414,7 @@ class TrainingMonitorApp:
                 "search": str(self.search_var.get()),
                 "auto_refresh": bool(self.auto_refresh_var.get()),
                 "trend_metric": str(self.trend_metric_var.get()),
+                "trend_window": str(self.trend_window_var.get()),
                 "sort_col": self.sort_col,
                 "sort_reverse": bool(self.sort_reverse),
             }
@@ -1749,8 +2523,12 @@ class TrainingMonitorApp:
             "pref_pairs": snap.pref_pairs,
             "loss": snap.loss,
             "lr": snap.lr,
+            "rdrop": snap.rdrop,
+            "wpo_std": snap.wpo_std,
             "beta": snap.beta,
             "margin": snap.margin,
+            "pref_objective": snap.pref_objective,
+            "pref_reference_pairs": snap.pref_reference_pairs,
             "progress_units": snap.progress_units,
             "total_units": snap.total_units,
             "progress_percent": snap.progress_percent,
@@ -1777,8 +2555,14 @@ class TrainingMonitorApp:
             "launch_hint": snap.launch_hint,
             "command_line": snap.command_line,
             "launch_command": snap.launch_command,
+            "runtime_summary": snap.runtime_summary,
+            "adapter_summary": snap.adapter_summary,
+            "source_balance_summary": snap.source_balance_summary,
+            "objective_summary": snap.objective_summary,
             "data_summary": snap.data_summary,
+            "eval_summary": snap.eval_summary,
             "sft_filter_summary": snap.sft_filter_summary,
+            "distill_config_summary": snap.distill_config_summary,
             "distill_summary": snap.distill_summary,
             "pref_mining_summary": snap.pref_mining_summary,
             "pref_selection_summary": snap.pref_selection_summary,
@@ -1846,65 +2630,207 @@ class TrainingMonitorApp:
     def _draw_selected_trend(self, run_name: Optional[str]) -> None:
         self.trend_canvas.delete("all")
         if not run_name:
-            self.trend_canvas.create_text(10, 40, anchor="w", text="No run selected", fill="#777777")
+            self.trend_canvas.create_text(10, 55, anchor="w", text="No run selected", fill="#777777")
             return
 
         metric = str(self.trend_metric_var.get() or "progress").strip().lower()
+        line_color = "#007acc"
+        fill_color = "#0a2d4d"
+        clamp_zero = False
+        fixed_min: Optional[float] = None
+        fixed_max: Optional[float] = None
+
         if metric == "loss":
             history = self.loss_history.get(run_name, [])
             label = "loss"
             formatter = lambda v: f"{v:.4f}"
+            line_color = "#d18616"
+            fill_color = "#3b2507"
+            clamp_zero = True
         elif metric == "lr":
             history = self.lr_history.get(run_name, [])
             label = "lr"
             formatter = lambda v: f"{v:.3g}"
+            line_color = "#4ec9b0"
+            fill_color = "#0b2f28"
+            clamp_zero = True
+        elif metric == "rdrop":
+            history = self.rdrop_history.get(run_name, [])
+            label = "rdrop"
+            formatter = lambda v: f"{v:.4f}"
+            line_color = "#c586c0"
+            fill_color = "#311630"
+            clamp_zero = True
+        elif metric == "wpo_std":
+            history = self.wpo_std_history.get(run_name, [])
+            label = "wpo_std"
+            formatter = lambda v: f"{v:.4f}"
+            line_color = "#d7ba7d"
+            fill_color = "#3b2e13"
+            clamp_zero = True
         elif metric == "rate":
             history = self.rate_history.get(run_name, [])
             label = "steps/h"
             formatter = lambda v: f"{v:.2f}"
+            line_color = "#89d185"
+            fill_color = "#163620"
+            clamp_zero = True
+        elif metric == "cpu":
+            history = self.cpu_history.get(run_name, [])
+            label = "cpu"
+            formatter = lambda v: f"{v:.0f}%"
+            line_color = "#f14c4c"
+            fill_color = "#3b1212"
+            fixed_min = 0.0
+            fixed_max = 100.0
+        elif metric == "ram":
+            history = self.ram_history.get(run_name, [])
+            label = "ram"
+            formatter = lambda v: f"{v:.2f} GB"
+            line_color = "#cca700"
+            fill_color = "#3b3209"
+            clamp_zero = True
+        elif metric == "stale":
+            history = self.stale_history.get(run_name, [])
+            label = "stale"
+            formatter = lambda v: f"{v:.1f}m"
+            line_color = "#c586c0"
+            fill_color = "#311630"
+            clamp_zero = True
         else:
             history = self.display_progress_history.get(run_name, [])
             label = "progress"
             formatter = lambda v: f"{v:.1f}%"
+            fixed_min = 0.0
+            fixed_max = 100.0
 
         if len(history) < 2:
-            self.trend_canvas.create_text(10, 40, anchor="w", text="Collecting trend data...", fill="#777777")
+            self.trend_canvas.create_text(10, 55, anchor="w", text="Collecting trend data...", fill="#777777")
             return
 
-        w = int(self.trend_canvas.winfo_width() or 620)
-        h = int(self.trend_canvas.winfo_height() or 80)
-        pad = 6
+        w, h = _resolve_canvas_size(
+            self.trend_canvas.winfo_width(),
+            self.trend_canvas.winfo_height(),
+            default_width=620,
+            default_height=110,
+            min_width=220,
+            min_height=72,
+        )
+        pad = 10
         now = time.time()
-        start_ts = now - 3600.0
+        window_key = str(self.trend_window_var.get() or "60m")
+        start_ts = now - _history_window_seconds(window_key)
         points = [(t, v) for (t, v) in history if t >= start_ts]
         if len(points) < 2:
             points = history[-2:]
         t_min = points[0][0]
         t_max = points[-1][0]
-        v_min = min(v for _, v in points)
-        v_max = max(v for _, v in points)
+        v_min = min(v for _, v in points) if fixed_min is None else float(fixed_min)
+        v_max = max(v for _, v in points) if fixed_max is None else float(fixed_max)
+        if clamp_zero:
+            v_min = min(0.0, v_min)
         if t_max - t_min < 1e-6:
             t_max = t_min + 1.0
         if v_max - v_min < 1e-6:
             v_max = v_min + 1.0
 
-        for frac in (0.25, 0.5, 0.75):
+        for frac in (0.2, 0.4, 0.6, 0.8):
             y = pad + (h - 2 * pad) * frac
-            self.trend_canvas.create_line(pad, y, w - pad, y, fill="#f0f0f0")
-        self.trend_canvas.create_rectangle(pad, pad, w - pad, h - pad, outline="#dddddd")
+            self.trend_canvas.create_line(pad, y, w - pad, y, fill="#3e3e42")
+        self.trend_canvas.create_rectangle(pad, pad, w - pad, h - pad, outline="#454545")
         xy: List[float] = []
         for t, v in points:
             x = pad + (w - 2 * pad) * ((t - t_min) / (t_max - t_min))
             y = (h - pad) - (h - 2 * pad) * ((v - v_min) / (v_max - v_min))
             xy.extend([x, y])
+
         if len(xy) >= 4:
-            self.trend_canvas.create_line(*xy, fill="#2c7be5", width=2, smooth=True)
+            area_xy = [xy[0], h - pad] + xy + [xy[-2], h - pad]
+            self.trend_canvas.create_polygon(*area_xy, fill=fill_color, outline="")
+            self.trend_canvas.create_line(*xy, fill=line_color, width=2, smooth=False)
+
+        self.trend_canvas.create_text(
+            pad + 2,
+            pad + 2,
+            anchor="nw",
+            text=f"{window_key} window | {len(points)} pts",
+            fill="#9da5b4",
+        )
         self.trend_canvas.create_text(
             w - pad - 4,
             pad + 2,
             anchor="ne",
             text=f"{label}: {formatter(points[-1][1])} | min {formatter(v_min)} max {formatter(v_max)}",
-            fill="#444444",
+            fill="#d4d4d4",
+        )
+
+    def _draw_phase_breakdown(self, snap: Optional[RunSnapshot]) -> None:
+        self.phase_canvas.delete("all")
+        if snap is None:
+            self.phase_canvas.create_text(10, 22, anchor="w", text="No run selected", fill="#777777")
+            return
+
+        rows = _phase_breakdown_rows(snap)
+        if not rows:
+            self.phase_canvas.create_text(10, 22, anchor="w", text="No phase data yet", fill="#777777")
+            return
+
+        w, h = _resolve_canvas_size(
+            self.phase_canvas.winfo_width(),
+            self.phase_canvas.winfo_height(),
+            default_width=620,
+            default_height=44,
+            min_width=220,
+            min_height=36,
+        )
+        pad = 8
+        total_weight = sum(weight for _phase, weight, _frac, _active in rows)
+        if total_weight <= 0:
+            self.phase_canvas.create_text(10, 22, anchor="w", text="No phase weights available", fill="#777777")
+            return
+
+        phase_colors = {
+            "data": "#007acc",
+            "distill": "#4ec9b0",
+            "sft_setup": "#8a8a8a",
+            "sft": "#89d185",
+            "preference_mining": "#cca700",
+            "preference": "#d18616",
+        }
+
+        x = float(pad)
+        usable_w = max(1.0, float(w - 2 * pad))
+        y0 = float(pad)
+        y1 = float(h - pad)
+
+        for phase, weight, frac, active in rows:
+            seg_w = usable_w * (float(weight) / float(total_weight))
+            base_x1 = x + seg_w
+            color = phase_colors.get(phase, "#569cd6")
+            self.phase_canvas.create_rectangle(x, y0, base_x1, y1, fill="#1f1f1f", outline="#454545")
+            fill_x1 = x + max(0.0, min(seg_w, seg_w * float(frac)))
+            if fill_x1 > x:
+                self.phase_canvas.create_rectangle(x, y0, fill_x1, y1, fill=color, outline="")
+            if active:
+                self.phase_canvas.create_rectangle(x, y0, base_x1, y1, outline="#ffffff", width=2)
+
+            label = phase.replace("_", " ")
+            pct_txt = f"{int(round(frac * 100.0))}%"
+            if seg_w >= 70:
+                self.phase_canvas.create_text(
+                    x + seg_w / 2.0,
+                    (y0 + y1) / 2.0,
+                    text=f"{label} {pct_txt}",
+                    fill="#d4d4d4",
+                )
+            x = base_x1
+
+        self.phase_canvas.create_text(
+            w - pad,
+            3,
+            anchor="ne",
+            text=f"Stage: {snap.stage}",
+            fill="#9da5b4",
         )
 
     def _append_history_point(
@@ -1913,8 +2839,8 @@ class TrainingMonitorApp:
         run_name: str,
         ts: float,
         value: float,
-        keep_seconds: float = 3600.0,
-        keep_points: int = 600,
+        keep_seconds: float = 21600.0,
+        keep_points: int = 1500,
     ) -> List[Tuple[float, float]]:
         history = store.setdefault(run_name, [])
         history.append((float(ts), float(value)))
@@ -1976,6 +2902,11 @@ class TrainingMonitorApp:
                         (snap.launch_command or "").lower(),
                         (snap.health_summary or "").lower(),
                         (snap.err_summary or "").lower(),
+                        (snap.runtime_summary or "").lower(),
+                        (snap.adapter_summary or "").lower(),
+                        (snap.source_balance_summary or "").lower(),
+                        (snap.objective_summary or "").lower(),
+                        (snap.pref_objective or "").lower(),
                         (snap.data_summary or "").lower(),
                         (snap.sft_filter_summary or "").lower(),
                         (snap.distill_summary or "").lower(),
@@ -1995,6 +2926,8 @@ class TrainingMonitorApp:
             return snap.status
         if col == "stage":
             return snap.stage
+        if col == "device":
+            return _runtime_device_value(snap)
         if col == "sft":
             return snap.sft_step
         if col == "pref":
@@ -2030,6 +2963,8 @@ class TrainingMonitorApp:
             return snap.out_last_write_ts
         if col == "pid":
             return -1 if snap.pid is None else snap.pid
+        if col == "cpu_ram":
+            return -1.0 if snap.cpu_percent is None else snap.cpu_percent
         return snap.run_name.lower()
 
     def _sort_by_column(self, col: str) -> None:
@@ -2037,7 +2972,7 @@ class TrainingMonitorApp:
             self.sort_reverse = not self.sort_reverse
         else:
             self.sort_col = col
-            self.sort_reverse = True if col in {"updated", "prog", "rate", "loss", "sft", "pref", "eta_conf"} else False
+            self.sort_reverse = True if col in {"updated", "prog", "rate", "loss", "sft", "pref", "eta_conf", "cpu_ram"} else False
         self.refresh()
 
     def _apply_eta_and_rate(self, snapshots: Sequence[RunSnapshot]) -> None:
@@ -2071,6 +3006,40 @@ class TrainingMonitorApp:
                     ts=now,
                     value=float(snap.lr),
                 )
+            if snap.rdrop is not None:
+                self._append_history_point(
+                    store=self.rdrop_history,
+                    run_name=snap.run_name,
+                    ts=now,
+                    value=float(snap.rdrop),
+                )
+            if snap.wpo_std is not None:
+                self._append_history_point(
+                    store=self.wpo_std_history,
+                    run_name=snap.run_name,
+                    ts=now,
+                    value=float(snap.wpo_std),
+                )
+            if snap.cpu_percent is not None:
+                self._append_history_point(
+                    store=self.cpu_history,
+                    run_name=snap.run_name,
+                    ts=now,
+                    value=float(snap.cpu_percent),
+                )
+            if snap.ram_gb is not None:
+                self._append_history_point(
+                    store=self.ram_history,
+                    run_name=snap.run_name,
+                    ts=now,
+                    value=float(snap.ram_gb),
+                )
+            self._append_history_point(
+                store=self.stale_history,
+                run_name=snap.run_name,
+                ts=now,
+                value=float(snap.stale_minutes),
+            )
 
             rate_per_sec = 0.0
             if len(history) >= 2:
@@ -2169,12 +3138,17 @@ class TrainingMonitorApp:
             pref_txt = str(snap.pref_step)
             if snap.pref_target_steps is not None and snap.pref_target_steps > 0:
                 pref_txt = f"{snap.pref_step}/{snap.pref_target_steps}"
+            device_txt = _runtime_device_value(snap)
 
             row_tags = [snap.status]
             if snap.err_signal == "error":
                 row_tags.append("err_error")
             elif snap.err_signal == "warn":
                 row_tags.append("err_warn")
+                
+            cpu_ram_txt = "-"
+            if snap.cpu_percent is not None and snap.ram_gb is not None:
+                cpu_ram_txt = f"{snap.cpu_percent:.0f}% | {snap.ram_gb:.1f}G"
 
             self.tree.insert(
                 "",
@@ -2184,6 +3158,7 @@ class TrainingMonitorApp:
                     snap.run_name,
                     snap.status,
                     snap.stage,
+                    device_txt,
                     sft_txt,
                     pref_txt,
                     self._display_work_text(snap),
@@ -2198,6 +3173,7 @@ class TrainingMonitorApp:
                     f"{snap.stale_minutes:.1f}",
                     updated,
                     pid_txt,
+                    cpu_ram_txt,
                 ),
                 tags=tuple(row_tags),
             )
@@ -2215,6 +3191,7 @@ class TrainingMonitorApp:
             self.selected_ckpt_eta_var.set("Next Ckpt: -")
             self.selected_rate_var.set("Rate: -")
             self.selected_eta_confidence_var.set("ETA Confidence: -")
+            self._draw_phase_breakdown(None)
 
         self._update_fleet_summary(all_snapshots)
 
@@ -2239,6 +3216,7 @@ class TrainingMonitorApp:
             f"| Last refresh: {_fmt_ts(time.time())} | Root: {self.root_dir}"
         )
         self._draw_selected_trend(self._selected_run_name())
+        self._draw_phase_breakdown(self._selected_snapshot())
 
     def _selected_run_name(self) -> Optional[str]:
         sel = self.tree.selection()
@@ -2255,6 +3233,7 @@ class TrainingMonitorApp:
             self.selected_rate_var.set("Rate: -")
             self.selected_eta_confidence_var.set("ETA Confidence: -")
             self._draw_selected_trend(None)
+            self._draw_phase_breakdown(None)
             return
         snap = self.current_snapshots.get(run_name)
         if snap is None:
@@ -2264,6 +3243,7 @@ class TrainingMonitorApp:
             self.selected_rate_var.set("Rate: -")
             self.selected_eta_confidence_var.set("ETA Confidence: -")
             self._draw_selected_trend(None)
+            self._draw_phase_breakdown(None)
             return
 
         display_progress = self._display_progress_percent(snap)
@@ -2317,8 +3297,12 @@ class TrainingMonitorApp:
             f"pref_pairs: {snap.pref_pairs}",
             f"loss: {snap.loss if snap.loss is not None else '-'}",
             f"lr: {snap.lr if snap.lr is not None else '-'}",
+            f"rdrop: {snap.rdrop if snap.rdrop is not None else '-'}",
+            f"wpo_std: {snap.wpo_std if snap.wpo_std is not None else '-'}",
             f"beta: {snap.beta if snap.beta is not None else '-'}",
             f"margin: {snap.margin if snap.margin is not None else '-'}",
+            f"pref_objective: {snap.pref_objective}",
+            f"pref_reference_pairs: {snap.pref_reference_pairs if snap.pref_reference_pairs is not None else '-'}",
             f"last_checkpoint: stage={snap.last_checkpoint_stage} step={snap.last_checkpoint_step}",
             f"save_every_steps: {snap.save_every_steps if snap.save_every_steps is not None else '-'}",
             f"checkpoints_seen: {snap.checkpoint_count}",
@@ -2333,8 +3317,14 @@ class TrainingMonitorApp:
             f"next_checkpoint_eta: {_fmt_eta(snap.checkpoint_eta_seconds)}",
             f"step_rate_per_hour: {snap.step_rate_per_hour if snap.step_rate_per_hour is not None else '-'}",
             f"stage_rate: {snap.stage_rate_label}",
+            f"runtime_summary: {snap.runtime_summary}",
+            f"adapter_summary: {snap.adapter_summary}",
+            f"source_balance_summary: {snap.source_balance_summary}",
+            f"objective_summary: {snap.objective_summary}",
             f"data_summary: {snap.data_summary}",
+            f"eval_summary: {snap.eval_summary}",
             f"sft_filter_summary: {snap.sft_filter_summary}",
+            f"distill_config_summary: {snap.distill_config_summary}",
             f"distill_summary: {snap.distill_summary}",
             f"pref_mining_summary: {snap.pref_mining_summary}",
             f"pref_selection_summary: {snap.pref_selection_summary}",
@@ -2366,8 +3356,29 @@ class TrainingMonitorApp:
             lines.append("(empty)")
 
         self.detail_text.delete("1.0", tk.END)
-        self.detail_text.insert("1.0", "\n".join(lines))
+        
+        self.detail_text.tag_configure("error", foreground="#f14c4c")
+        self.detail_text.tag_configure("warn", foreground="#cca700")
+        self.detail_text.tag_configure("ok", foreground="#89d185")
+        self.detail_text.tag_configure("sys", foreground="#569cd6")
+        
+        for i, line in enumerate(lines, start=1):
+            self.detail_text.insert(tk.END, line + "\n")
+            low = line.lower()
+            if "error" in low or "traceback" in low or "exception" in low or "failed" in low:
+                self.detail_text.tag_add("error", f"{i}.0", f"{i}.end")
+            elif "warn" in low:
+                self.detail_text.tag_add("warn", f"{i}.0", f"{i}.end")
+            elif "ok" in low or "complete:" in low or "progress:" in low or "[data]" in low or "[sft]" in low:
+                self.detail_text.tag_add("ok", f"{i}.0", f"{i}.end")
+            elif ":" in line and not line.startswith(" ") and not line.startswith("["):
+                self.detail_text.tag_add("sys", f"{i}.0", f"{i}.end")
+
+        self.detail_text.delete("end-1c", tk.END)
+        if self.auto_refresh_var.get():
+            self.detail_text.see(tk.END)
         self._draw_selected_trend(run_name)
+        self._draw_phase_breakdown(snap)
 
 
 def parse_args() -> argparse.Namespace:

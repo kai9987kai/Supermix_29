@@ -3,14 +3,19 @@ import os
 import sys
 from pathlib import Path
 
+import torch
+
 
 sys.path.append(os.path.join(os.getcwd(), "source"))
 
 from qwen_supermix_pipeline import (
     ChatPair,
+    _checkpoint_training_state_path,
     _build_explicit_resume_checkpoint,
     _merge_distillation_pairs,
+    _restore_checkpoint_training_state,
     _resolve_latest_resume_checkpoint,
+    _save_checkpoint_training_state,
 )
 
 
@@ -109,3 +114,59 @@ def test_build_explicit_resume_checkpoint_preserves_external_sft_provenance(tmp_
     assert state.sft_steps == 960
     assert state.preference_steps == 0
     assert state.adapter_dir == adapter_dir
+
+
+def test_checkpoint_training_state_round_trip(tmp_path: Path):
+    model = torch.nn.Linear(4, 3)
+    optim = torch.optim.AdamW(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lambda _step: 1.0)
+
+    x = torch.randn(2, 4)
+    loss = model(x).sum()
+    loss.backward()
+    optim.step()
+    scheduler.step()
+    optim.zero_grad(set_to_none=True)
+
+    adapter_dir = tmp_path / "run" / "checkpoints" / "sft_step_00001" / "adapter"
+    adapter_dir.mkdir(parents=True)
+    state_path = _save_checkpoint_training_state(adapter_dir, stage="sft", optimizer=optim, scheduler=scheduler)
+
+    model_restored = torch.nn.Linear(4, 3)
+    optim_restored = torch.optim.AdamW(model_restored.parameters(), lr=0.1)
+    scheduler_restored = torch.optim.lr_scheduler.LambdaLR(optim_restored, lr_lambda=lambda _step: 1.0)
+    restored = _restore_checkpoint_training_state(
+        adapter_dir_or_checkpoint_dir=adapter_dir,
+        stage="sft",
+        optimizer=optim_restored,
+        scheduler=scheduler_restored,
+        device=torch.device("cpu"),
+    )
+
+    assert state_path == _checkpoint_training_state_path(adapter_dir)
+    assert state_path.exists()
+    assert restored is True
+    assert optim_restored.state_dict()["state"], "Expected optimizer state to be restored"
+    assert scheduler_restored.state_dict()["last_epoch"] == scheduler.state_dict()["last_epoch"]
+
+
+def test_checkpoint_training_state_stage_mismatch_is_ignored(tmp_path: Path):
+    model = torch.nn.Linear(2, 2)
+    optim = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lambda _step: 1.0)
+    adapter_dir = tmp_path / "run" / "checkpoints" / "pref_step_00002" / "adapter"
+    adapter_dir.mkdir(parents=True)
+    _save_checkpoint_training_state(adapter_dir, stage="preference", optimizer=optim, scheduler=scheduler)
+
+    model_restored = torch.nn.Linear(2, 2)
+    optim_restored = torch.optim.AdamW(model_restored.parameters(), lr=0.01)
+    scheduler_restored = torch.optim.lr_scheduler.LambdaLR(optim_restored, lr_lambda=lambda _step: 1.0)
+    restored = _restore_checkpoint_training_state(
+        adapter_dir_or_checkpoint_dir=adapter_dir,
+        stage="sft",
+        optimizer=optim_restored,
+        scheduler=scheduler_restored,
+        device=torch.device("cpu"),
+    )
+
+    assert restored is False

@@ -3,6 +3,8 @@
 import math
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 import torch
 
@@ -62,6 +64,56 @@ def _import_progress_heartbeat_helper():
     from source.qwen_supermix_pipeline import _should_log_progress_heartbeat
 
     return _should_log_progress_heartbeat
+
+
+def _import_split_and_io_helpers():
+    from source.qwen_supermix_pipeline import ChatPair, load_saved_chat_pairs, save_jsonl, split_train_eval
+
+    return ChatPair, split_train_eval, save_jsonl, load_saved_chat_pairs
+
+
+def _import_sft_packing_helpers():
+    from source.qwen_supermix_pipeline import ChatPair, _pack_sft_rows, build_rows
+
+    return ChatPair, build_rows, _pack_sft_rows
+
+
+class _ToyTokenizer:
+    pad_token_id = 0
+    eos_token_id = 999
+
+    def __call__(self, text, add_special_tokens=False, truncation=True, max_length=None):
+        del add_special_tokens
+        input_ids = [1 + (ord(ch) % 251) for ch in str(text)]
+        if truncation and max_length is not None:
+            input_ids = input_ids[: max(0, int(max_length))]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": [1] * len(input_ids),
+        }
+
+
+def _make_sft_row(
+    total_tokens: int,
+    supervised_tokens: int,
+    sample_weight: float = 1.0,
+    start_token: int = 11,
+    source: str = "dataset",
+):
+    assert total_tokens > supervised_tokens >= 1
+    input_ids = list(range(start_token, start_token + total_tokens))
+    labels = [-100] * (total_tokens - supervised_tokens) + list(
+        range(start_token + 1000, start_token + 1000 + supervised_tokens)
+    )
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * total_tokens,
+        "labels": labels,
+        "sample_weight": float(sample_weight),
+        "sequence_tokens": int(total_tokens),
+        "supervised_tokens": int(supervised_tokens),
+        "source": str(source),
+    }
 
 
 def test_cosine_restarts_produces_periodic_peaks():
@@ -220,6 +272,80 @@ def test_length_bucket_sampler_groups_similar_lengths():
         spreads.append(max(batch_lengths) - min(batch_lengths))
     assert max(spreads) <= 1, f"Expected tight batches, got spreads={spreads}"
     print(f"  [ok] length bucketing spreads={spreads}")
+
+
+def test_build_rows_tracks_supervised_tokens_and_source():
+    ChatPair, build_rows, _pack_sft_rows = _import_sft_packing_helpers()
+    del _pack_sft_rows
+    tokenizer = _ToyTokenizer()
+    rows = build_rows(
+        tokenizer,
+        [ChatPair(user="Summarize the report.", assistant="The report says sales improved.", source="briefing")],
+        max_length=128,
+        row_weight_fn=lambda _pair: 1.25,
+    )
+    assert len(rows) == 1
+    assert int(rows[0]["supervised_tokens"]) > 0
+    assert rows[0]["source"] == "briefing"
+    assert math.isclose(float(rows[0]["sample_weight"]), 1.25, rel_tol=1e-9)
+    print("  [ok] build_rows tracks supervised tokens and source")
+
+
+def test_sft_true_packing_preserves_supervised_tokens_and_max_length():
+    ChatPair, build_rows, pack_sft_rows = _import_sft_packing_helpers()
+    del ChatPair, build_rows
+    rows = [
+        _make_sft_row(total_tokens=12, supervised_tokens=4, start_token=10),
+        _make_sft_row(total_tokens=11, supervised_tokens=5, start_token=40),
+        _make_sft_row(total_tokens=10, supervised_tokens=3, start_token=70),
+        _make_sft_row(total_tokens=8, supervised_tokens=2, start_token=90),
+    ]
+    before_supervised = sum(int(row["supervised_tokens"]) for row in rows)
+    packed = pack_sft_rows(rows, max_length=24, separator_token_id=999, max_samples_per_row=0)
+    after_supervised = sum(int(row["supervised_tokens"]) for row in packed)
+
+    assert len(packed) == 2, f"Expected two packed rows, got {len(packed)}"
+    assert after_supervised == before_supervised
+    assert all(len(row["input_ids"]) <= 24 for row in packed)
+    assert all(int(row.get("packed_sample_count", 1)) >= 1 for row in packed)
+    print("  [ok] true packing preserves supervised tokens and max length")
+
+
+def test_sft_true_packing_masks_separator_and_aggregates_weights():
+    ChatPair, build_rows, pack_sft_rows = _import_sft_packing_helpers()
+    del ChatPair, build_rows
+    rows = [
+        _make_sft_row(total_tokens=10, supervised_tokens=4, sample_weight=0.5, start_token=10, source="news"),
+        _make_sft_row(total_tokens=9, supervised_tokens=2, sample_weight=1.5, start_token=40, source="news"),
+    ]
+    packed = pack_sft_rows(rows, max_length=20, separator_token_id=999, max_samples_per_row=2)
+
+    assert len(packed) == 1
+    row = packed[0]
+    separator_positions = [idx for idx, token in enumerate(row["input_ids"]) if int(token) == 999]
+    expected_weight = ((0.5 * 4.0) + (1.5 * 2.0)) / 6.0
+
+    assert int(row.get("packed_sample_count", 1)) == 2
+    assert separator_positions == [10], f"Expected one separator after the first segment, got {separator_positions}"
+    assert int(row["labels"][10]) == -100
+    assert int(row["attention_mask"][10]) == 1
+    assert math.isclose(float(row["sample_weight"]), expected_weight, rel_tol=1e-6)
+    print("  [ok] true packing masks separators and aggregates weights")
+
+
+def test_sft_true_packing_respects_max_samples_per_row():
+    ChatPair, build_rows, pack_sft_rows = _import_sft_packing_helpers()
+    del ChatPair, build_rows
+    rows = [
+        _make_sft_row(total_tokens=8, supervised_tokens=2, start_token=10),
+        _make_sft_row(total_tokens=7, supervised_tokens=2, start_token=30),
+        _make_sft_row(total_tokens=6, supervised_tokens=2, start_token=50),
+    ]
+    packed = pack_sft_rows(rows, max_length=30, separator_token_id=999, max_samples_per_row=2)
+    packed_counts = sorted(int(row.get("packed_sample_count", 1)) for row in packed)
+
+    assert packed_counts == [1, 2], f"Expected a 2-sample pack plus one single row, got {packed_counts}"
+    print("  [ok] true packing respects max_samples_per_row")
 
 
 def test_knowledge_density_prefers_dense_answers():
@@ -604,6 +730,52 @@ def test_benchmark_sample_comparison_ranks_worst_regressions_first():
     print("  [ok] benchmark sample comparison ranks worst regressions first")
 
 
+def test_split_train_eval_auto_groups_metadata_events():
+    ChatPair, split_train_eval, _save_jsonl, _load_saved_chat_pairs = _import_split_and_io_helpers()
+    pairs = [
+        ChatPair(user="event a ask 1", assistant="event a ans 1", source="world.jsonl", metadata={"event_id": "a"}),
+        ChatPair(user="event a ask 2", assistant="event a ans 2", source="world.jsonl", metadata={"event_id": "a"}),
+        ChatPair(user="event b ask 1", assistant="event b ans 1", source="world.jsonl", metadata={"event_id": "b"}),
+        ChatPair(user="event b ask 2", assistant="event b ans 2", source="world.jsonl", metadata={"event_id": "b"}),
+        ChatPair(user="event c ask 1", assistant="event c ans 1", source="world.jsonl", metadata={"event_id": "c"}),
+        ChatPair(user="event c ask 2", assistant="event c ans 2", source="world.jsonl", metadata={"event_id": "c"}),
+    ]
+
+    train_pairs, eval_pairs = split_train_eval(pairs, eval_size=2, seed=7, split_mode="auto")
+    train_events = {str(pair.metadata.get("event_id", "")) for pair in train_pairs}
+    eval_events = {str(pair.metadata.get("event_id", "")) for pair in eval_pairs}
+
+    assert len(eval_pairs) == 2
+    assert len(eval_events) == 1, f"Expected a single held-out event group, got {eval_events}"
+    assert train_events.isdisjoint(eval_events), f"Train and eval should not share events: {train_events} vs {eval_events}"
+    print(f"  [ok] auto split held out event group={sorted(eval_events)}")
+
+
+def test_save_jsonl_round_trips_pair_metadata():
+    ChatPair, _split_train_eval, save_jsonl, load_saved_chat_pairs = _import_split_and_io_helpers()
+    pair = ChatPair(
+        user="Summarize the update.",
+        assistant="As of February 19, 2026, the update is ...",
+        source="conversation_data.world_events_2026_02_19.jsonl",
+        metadata={
+            "event_id": "sudan_genocide_hallmarks",
+            "topic": "world_events",
+            "as_of": "February 19, 2026",
+            "record_source": "https://apnews.com/article/example",
+        },
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "pairs.jsonl"
+        save_jsonl(path, [pair])
+        loaded = load_saved_chat_pairs(path)
+
+    assert len(loaded) == 1
+    assert loaded[0].source == pair.source
+    assert loaded[0].metadata == pair.metadata
+    print("  [ok] save_jsonl preserves chat-pair metadata")
+
+
 def test_distill_progress_heartbeat_logs_even_without_new_accepts():
     should_log = _import_progress_heartbeat_helper()
     assert should_log(visited=200, log_every=40, now=80.0, last_log_time=55.0, heartbeat_seconds=30.0)
@@ -627,6 +799,10 @@ def run_all():
         ("Gradient noise decay", test_gradient_noise_decays),
         ("Curriculum ramp", test_curriculum_ramp_reduces_low_weight_samples),
         ("Length bucket sampler", test_length_bucket_sampler_groups_similar_lengths),
+        ("Build rows supervised tokens", test_build_rows_tracks_supervised_tokens_and_source),
+        ("SFT true packing bounds", test_sft_true_packing_preserves_supervised_tokens_and_max_length),
+        ("SFT true packing separators", test_sft_true_packing_masks_separator_and_aggregates_weights),
+        ("SFT true packing max samples", test_sft_true_packing_respects_max_samples_per_row),
         ("Knowledge density scoring", test_knowledge_density_prefers_dense_answers),
         ("Distillation ranking", test_distillation_rank_prefers_concise_high_gain_candidates),
         ("Preference length control", test_preference_length_control_penalizes_overlong_chosen),
@@ -638,6 +814,8 @@ def run_all():
         ("Token-budget SFT selection", test_sft_token_budget_prefers_dense_short_pairs),
         ("Scoped token-budget SFT selection", test_sft_scoped_selection_only_trims_teacher_subset),
         ("Benchmark sample comparison", test_benchmark_sample_comparison_ranks_worst_regressions_first),
+        ("Auto eval split grouping", test_split_train_eval_auto_groups_metadata_events),
+        ("Chat-pair metadata roundtrip", test_save_jsonl_round_trips_pair_metadata),
         ("Distill progress heartbeat", test_distill_progress_heartbeat_logs_even_without_new_accepts),
     ]
 

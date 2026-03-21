@@ -7,7 +7,7 @@ import random
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -58,6 +58,7 @@ class ChatPair:
     user: str
     assistant: str
     source: str = "dataset"
+    metadata: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -106,10 +107,44 @@ def _coerce_text(value: object) -> str:
     return str(value).strip()
 
 
-def _pairs_from_messages(messages: Sequence[Dict[str, object]]) -> List[ChatPair]:
+def _normalize_chat_pair_metadata(raw_metadata: Optional[Dict[str, object]]) -> Dict[str, object]:
+    if not isinstance(raw_metadata, dict):
+        return {}
+    out: Dict[str, object] = {}
+    for raw_key, raw_value in raw_metadata.items():
+        key = _coerce_text(raw_key)
+        if not key:
+            continue
+        if isinstance(raw_value, str):
+            value = raw_value.strip()
+            if value:
+                out[key] = value
+        elif isinstance(raw_value, (int, float, bool)) or raw_value is None:
+            out[key] = raw_value
+    return out
+
+
+def _extract_chat_pair_metadata(record: Dict[str, object]) -> Dict[str, object]:
+    raw_meta: Dict[str, object] = {}
+    for raw_key, raw_value in record.items():
+        key = _coerce_text(raw_key)
+        if not key or key in {"user", "assistant", "messages"}:
+            continue
+        if key == "source":
+            key = "record_source"
+        raw_meta[key] = raw_value
+    return _normalize_chat_pair_metadata(raw_meta)
+
+
+def _pairs_from_messages(
+    messages: Sequence[Dict[str, object]],
+    source: str = "dataset",
+    metadata: Optional[Dict[str, object]] = None,
+) -> List[ChatPair]:
     out: List[ChatPair] = []
     history: List[Tuple[str, str]] = []
     pending_user: Optional[str] = None
+    pair_metadata = _normalize_chat_pair_metadata(metadata)
     for msg in messages:
         role = _coerce_text(msg.get("role", "")).lower()
         text = _coerce_text(msg.get("content", msg.get("text")))
@@ -127,7 +162,14 @@ def _pairs_from_messages(messages: Sequence[Dict[str, object]]) -> List[ChatPair
                     user_text=pending_user,
                     max_turns=max_turns,
                 )
-            out.append(ChatPair(user=user_text, assistant=text))
+            out.append(
+                ChatPair(
+                    user=user_text,
+                    assistant=text,
+                    source=source,
+                    metadata=dict(pair_metadata),
+                )
+            )
             history.append((pending_user, text))
             pending_user = None
     return out
@@ -802,12 +844,26 @@ def _iter_clean_pairs_from_jsonl(
                 continue
 
             local_pairs: List[ChatPair] = []
+            pair_metadata = _extract_chat_pair_metadata(record)
             user = _coerce_text(record.get("user"))
             assistant = _coerce_text(record.get("assistant"))
             if user and assistant:
-                local_pairs.append(ChatPair(user=user, assistant=assistant))
+                local_pairs.append(
+                    ChatPair(
+                        user=user,
+                        assistant=assistant,
+                        source=path.name,
+                        metadata=dict(pair_metadata),
+                    )
+                )
             elif isinstance(record.get("messages"), list):
-                local_pairs.extend(_pairs_from_messages(record["messages"]))
+                local_pairs.extend(
+                    _pairs_from_messages(
+                        record["messages"],
+                        source=path.name,
+                        metadata=pair_metadata,
+                    )
+                )
 
             for pair in local_pairs:
                 stats["raw"] += 1
@@ -828,7 +884,12 @@ def _iter_clean_pairs_from_jsonl(
                     continue
                 seen.add(key)
                 stats["kept"] += 1
-                yield ChatPair(user=user_text, assistant=assistant_text, source=path.name)
+                yield ChatPair(
+                    user=user_text,
+                    assistant=assistant_text,
+                    source=path.name,
+                    metadata=dict(pair.metadata),
+                )
 
 
 def load_jsonl_pairs(
@@ -989,16 +1050,108 @@ def load_jsonl_pairs(
     return pairs
 
 
-def split_train_eval(pairs: List[ChatPair], eval_size: int, seed: int) -> Tuple[List[ChatPair], List[ChatPair]]:
+def _split_group_token(value: object) -> str:
+    text = _coerce_text(value)
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _chat_pair_split_group_key(pair: ChatPair) -> Tuple[str, str]:
+    metadata = pair.metadata if isinstance(pair.metadata, dict) else {}
+    split_group = _split_group_token(metadata.get("split_group"))
+    if split_group:
+        return "split_group", f"split_group:{split_group}"
+
+    event_id = _split_group_token(metadata.get("event_id"))
+    if event_id:
+        return "event_id", f"event_id:{event_id}"
+
+    record_source = _split_group_token(metadata.get("record_source"))
+    if record_source:
+        return "record_source", f"record_source:{record_source}"
+
+    pair_source = _split_group_token(pair.source)
+    if "://" in pair_source:
+        return "source_url", f"source_url:{pair_source}"
+
+    topic = _split_group_token(metadata.get("topic"))
+    as_of = _split_group_token(metadata.get("as_of"))
+    if topic and as_of:
+        return "topic_as_of", f"topic_as_of:{topic}|{as_of}"
+    if topic:
+        return "topic", f"topic:{topic}"
+
+    return "", ""
+
+
+def split_train_eval(
+    pairs: List[ChatPair],
+    eval_size: int,
+    seed: int,
+    split_mode: str = "auto",
+) -> Tuple[List[ChatPair], List[ChatPair]]:
     if len(pairs) < 2:
         raise ValueError("Need at least 2 samples to split train/eval.")
     rng = random.Random(seed)
+    eval_n = max(1, min(eval_size, len(pairs) - 1))
+    mode = str(split_mode or "auto").strip().lower()
+    if mode not in {"auto", "random"}:
+        mode = "auto"
+
+    if mode == "auto":
+        grouped_indices: Dict[str, List[int]] = {}
+        group_type_counts: Dict[str, int] = {}
+        ungrouped_indices: List[int] = []
+        for idx, pair in enumerate(pairs):
+            group_type, group_key = _chat_pair_split_group_key(pair)
+            if group_key:
+                grouped_indices.setdefault(group_key, []).append(idx)
+                group_type_counts[group_type] = group_type_counts.get(group_type, 0) + 1
+            else:
+                ungrouped_indices.append(idx)
+
+        if len(grouped_indices) >= 2:
+            grouped_items = list(grouped_indices.items())
+            rng.shuffle(grouped_items)
+            grouped_items.sort(key=lambda item: len(item[1]))
+            eval_idx: set = set()
+            eval_group_count = 0
+            for _group_key, indices in grouped_items:
+                if len(eval_idx) >= eval_n:
+                    break
+                if len(eval_idx) + len(indices) >= len(pairs):
+                    continue
+                eval_idx.update(indices)
+                eval_group_count += 1
+
+            if len(eval_idx) < eval_n and ungrouped_indices:
+                rng.shuffle(ungrouped_indices)
+                remaining_budget = min(eval_n - len(eval_idx), len(pairs) - len(eval_idx) - 1)
+                if remaining_budget > 0:
+                    eval_idx.update(ungrouped_indices[:remaining_budget])
+
+            if eval_idx and len(eval_idx) < len(pairs):
+                train = [pairs[i] for i in range(len(pairs)) if i not in eval_idx]
+                eval_pairs = [pairs[i] for i in range(len(pairs)) if i in eval_idx]
+                group_summary = ", ".join(
+                    f"{group_type}:{count}" for group_type, count in sorted(group_type_counts.items())
+                )
+                print(
+                    "[data] split: "
+                    f"mode=auto eval={len(eval_pairs)}/{len(pairs)} "
+                    f"grouped_groups={len(grouped_indices)} eval_groups={eval_group_count} "
+                    f"ungrouped={len(ungrouped_indices)} "
+                    f"group_types={group_summary if group_summary else '-'}"
+                )
+                return train, eval_pairs
+
     idx = list(range(len(pairs)))
     rng.shuffle(idx)
-    eval_n = max(1, min(eval_size, len(pairs) - 1))
     eval_idx = set(idx[:eval_n])
     train = [pairs[i] for i in range(len(pairs)) if i not in eval_idx]
     eval_pairs = [pairs[i] for i in range(len(pairs)) if i in eval_idx]
+    print(f"[data] split: mode=random eval={len(eval_pairs)}/{len(pairs)}")
     return train, eval_pairs
 
 
@@ -1592,6 +1745,8 @@ def build_rows(
             if row_weight_fn is not None:
                 row["sample_weight"] = float(max(0.05, base_weight))
             row["sequence_tokens"] = int(len(row["input_ids"]))
+            row["supervised_tokens"] = int(sum(1 for token in row["labels"] if int(token) != -100))
+            row["source"] = str(pair.source or "dataset")
             rows.append(row)
         if int(followup_paraphrase_aug) > 0:
             for variant_user in _followup_paraphrase_variants(pair.user, max_variants=int(followup_paraphrase_aug)):
@@ -1602,6 +1757,8 @@ def build_rows(
                 aug_weight = float(max(0.05, base_weight * float(followup_paraphrase_weight)))
                 aug_row["sample_weight"] = aug_weight
                 aug_row["sequence_tokens"] = int(len(aug_row["input_ids"]))
+                aug_row["supervised_tokens"] = int(sum(1 for token in aug_row["labels"] if int(token) != -100))
+                aug_row["source"] = str(pair.source or "dataset")
                 rows.append(aug_row)
                 augmented_rows += 1
     if not rows:
@@ -1609,6 +1766,122 @@ def build_rows(
     if augmented_rows > 0:
         print(f"[sft] added {augmented_rows} follow-up paraphrase augmentation rows")
     return rows
+
+
+def _row_supervised_token_count(row: Dict[str, object]) -> int:
+    value = row.get("supervised_tokens", 0)
+    try:
+        count = int(value)
+    except Exception:
+        count = 0
+    if count > 0:
+        return count
+    labels = row.get("labels", [])
+    if isinstance(labels, (list, tuple)):
+        return int(sum(1 for token in labels if int(token) != -100))
+    return 0
+
+
+def _pack_sft_rows(
+    rows: Sequence[Dict[str, object]],
+    max_length: int,
+    separator_token_id: int,
+    max_samples_per_row: int = 0,
+) -> List[Dict[str, object]]:
+    if not rows:
+        return []
+    max_row_length = max(1, int(max_length))
+    sample_cap = max(0, int(max_samples_per_row))
+    ordered_rows = sorted(
+        list(rows),
+        key=lambda row: int(row.get("sequence_tokens", len(row.get("input_ids", [])))),
+        reverse=True,
+    )
+    bins: List[Dict[str, object]] = []
+    for row in ordered_rows:
+        row_len = int(row.get("sequence_tokens", len(row.get("input_ids", []))))
+        if row_len <= 0:
+            continue
+        best_idx = -1
+        best_remaining = max_row_length + 1
+        for idx, packed_bin in enumerate(bins):
+            existing_rows = packed_bin["rows"]
+            if sample_cap > 0 and len(existing_rows) >= sample_cap:
+                continue
+            separator_cost = 1 if existing_rows else 0
+            used = int(packed_bin["used_tokens"])
+            if used + separator_cost + row_len > max_row_length:
+                continue
+            remaining = max_row_length - (used + separator_cost + row_len)
+            if remaining < best_remaining:
+                best_idx = idx
+                best_remaining = remaining
+        if best_idx < 0:
+            bins.append({"rows": [row], "used_tokens": row_len})
+            continue
+        bins[best_idx]["rows"].append(row)
+        bins[best_idx]["used_tokens"] = int(bins[best_idx]["used_tokens"]) + 1 + row_len
+
+    packed_rows: List[Dict[str, object]] = []
+    for packed_bin in bins:
+        segment_rows = list(packed_bin["rows"])
+        packed_input_ids: List[int] = []
+        packed_attention_mask: List[int] = []
+        packed_labels: List[int] = []
+        segment_lengths: List[int] = []
+        source_values: List[str] = []
+        total_supervised = 0
+        weight_numer = 0.0
+        weight_denom = 0
+        has_sample_weight = False
+        for idx, row in enumerate(segment_rows):
+            row_input = list(row["input_ids"])
+            row_attention = list(row["attention_mask"])
+            row_labels = list(row["labels"])
+            row_supervised = max(0, _row_supervised_token_count(row))
+            row_weight = float(row.get("sample_weight", 1.0))
+            if idx > 0:
+                packed_input_ids.append(int(separator_token_id))
+                packed_attention_mask.append(1)
+                packed_labels.append(-100)
+            packed_input_ids.extend(int(token) for token in row_input)
+            packed_attention_mask.extend(int(token) for token in row_attention)
+            packed_labels.extend(int(token) for token in row_labels)
+            segment_lengths.append(len(row_input))
+            total_supervised += row_supervised
+            if "sample_weight" in row:
+                has_sample_weight = True
+                weight_numer += float(max(1, row_supervised)) * row_weight
+                weight_denom += max(1, row_supervised)
+            source_values.append(str(row.get("source", "dataset") or "dataset"))
+        packed_row: Dict[str, object] = {
+            "input_ids": packed_input_ids,
+            "attention_mask": packed_attention_mask,
+            "labels": packed_labels,
+            "sequence_tokens": int(len(packed_input_ids)),
+            "supervised_tokens": int(total_supervised),
+            "packed_sample_count": int(len(segment_rows)),
+            "segment_lengths": segment_lengths,
+        }
+        unique_sources = sorted(set(source_values))
+        if len(unique_sources) == 1:
+            packed_row["source"] = unique_sources[0]
+        elif unique_sources:
+            packed_row["source"] = "packed_mix"
+        if has_sample_weight:
+            packed_row["sample_weight"] = float(weight_numer / max(1, weight_denom))
+        packed_rows.append(packed_row)
+    return packed_rows
+
+
+def _median_numeric(values: Sequence[int]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(int(v) for v in values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return float(ordered[mid])
+    return 0.5 * float(ordered[mid - 1] + ordered[mid])
 
 
 def collate_rows(rows: Sequence[Dict[str, object]], pad_token_id: int) -> Dict[str, torch.Tensor]:
@@ -1632,6 +1905,24 @@ def collate_rows(rows: Sequence[Dict[str, object]], pad_token_id: int) -> Dict[s
             [float(r.get("sample_weight", 1.0)) for r in rows],
             dtype=torch.float32,
         )
+    if any("segment_lengths" in r for r in rows):
+        segment_counts = [max(1, len(r.get("segment_lengths", []))) for r in rows]
+        max_segments = max(segment_counts)
+        batch_segment_lengths = []
+        batch_segment_weights = []
+        for r in rows:
+            lengths = [int(value) for value in r.get("segment_lengths", [len(r["input_ids"])])]
+            weights = [float(value) for value in r.get("segment_weights", [float(r.get("sample_weight", 1.0))])]
+            if len(weights) < len(lengths):
+                weights.extend([1.0] * (len(lengths) - len(weights)))
+            elif len(weights) > len(lengths):
+                weights = weights[: len(lengths)]
+            pad_segments = max_segments - len(lengths)
+            batch_segment_lengths.append(lengths + [0] * pad_segments)
+            batch_segment_weights.append(weights + [0.0] * pad_segments)
+        out["segment_count"] = torch.tensor(segment_counts, dtype=torch.long)
+        out["segment_lengths"] = torch.tensor(batch_segment_lengths, dtype=torch.long)
+        out["segment_weights"] = torch.tensor(batch_segment_weights, dtype=torch.float32)
     return out
 
 
@@ -2232,6 +2523,98 @@ def _sequence_average_log_prob(logits: torch.Tensor, labels: torch.Tensor) -> Tu
     lengths = valid_f.sum(dim=1).clamp_min(1.0)
     avg_log_prob = token_log_probs.sum(dim=1) / lengths
     return avg_log_prob, lengths
+
+
+def _packed_segment_average_values(
+    token_values: torch.Tensor,
+    valid_mask: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    segment_count: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    valid_f = valid_mask.to(token_values.dtype)
+    masked_values = token_values * valid_f
+    flat_values: List[torch.Tensor] = []
+    flat_lengths: List[torch.Tensor] = []
+    batch_size = int(token_values.shape[0])
+    for batch_idx in range(batch_size):
+        count = int(segment_count[batch_idx].item())
+        cursor = 0
+        for seg_idx in range(max(0, count)):
+            seg_len = int(segment_lengths[batch_idx, seg_idx].item())
+            if seg_len <= 0:
+                continue
+            shift_start = 0 if cursor <= 0 else cursor - 1
+            shift_end = max(shift_start, cursor + seg_len - 1)
+            seg_values = masked_values[batch_idx, shift_start:shift_end]
+            seg_valid = valid_f[batch_idx, shift_start:shift_end]
+            seg_token_count = seg_valid.sum().clamp_min(1.0)
+            flat_values.append(seg_values.sum() / seg_token_count)
+            flat_lengths.append(seg_token_count)
+            cursor += seg_len + 1
+    if not flat_values:
+        zero = token_values.new_zeros((1,))
+        one = token_values.new_ones((1,))
+        return zero, one
+    return torch.stack(flat_values), torch.stack(flat_lengths)
+
+
+def _packed_segment_average_log_prob(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    segment_count: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    shift_logits = logits[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    valid = shift_labels.ne(-100)
+    safe_labels = shift_labels.masked_fill(~valid, 0)
+    token_log_probs = torch.log_softmax(shift_logits, dim=-1).gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+    return _packed_segment_average_values(
+        token_values=token_log_probs,
+        valid_mask=valid,
+        segment_lengths=segment_lengths,
+        segment_count=segment_count,
+    )
+
+
+def _flatten_packed_segment_values(values: torch.Tensor, segment_count: torch.Tensor) -> torch.Tensor:
+    flat_values: List[torch.Tensor] = []
+    for batch_idx in range(int(values.shape[0])):
+        count = int(segment_count[batch_idx].item())
+        if count <= 0:
+            continue
+        flat_values.append(values[batch_idx, :count])
+    if not flat_values:
+        return values.new_zeros((0,))
+    return torch.cat(flat_values, dim=0)
+
+
+def _packed_segment_symmetric_token_kl(
+    logits_a: torch.Tensor,
+    logits_b: torch.Tensor,
+    labels: torch.Tensor,
+    segment_lengths: torch.Tensor,
+    segment_count: torch.Tensor,
+) -> torch.Tensor:
+    shift_labels = labels[:, 1:]
+    valid = shift_labels.ne(-100)
+    if not bool(valid.any()):
+        return logits_a.new_zeros((1,))
+
+    shift_logits_a = logits_a[:, :-1, :]
+    shift_logits_b = logits_b[:, :-1, :]
+    logp_a = torch.log_softmax(shift_logits_a, dim=-1)
+    logp_b = torch.log_softmax(shift_logits_b, dim=-1)
+    kl_ab = torch.nn.functional.kl_div(logp_b, logp_a, reduction="none", log_target=True).sum(dim=-1)
+    kl_ba = torch.nn.functional.kl_div(logp_a, logp_b, reduction="none", log_target=True).sum(dim=-1)
+    sym = 0.5 * (kl_ab + kl_ba)
+    flat_sym, _ = _packed_segment_average_values(
+        token_values=sym,
+        valid_mask=valid,
+        segment_lengths=segment_lengths,
+        segment_count=segment_count,
+    )
+    return flat_sym
 
 
 def _weighted_mean(values: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -4143,6 +4526,8 @@ def finetune_qwen(
     sft_grad_noise_eta: float,
     sft_length_bucketed_batches: bool,
     sft_length_bucket_window_mult: int,
+    sft_true_packing: bool,
+    sft_packing_max_samples_per_row: int,
     sft_selection_strategy: str,
     sft_selection_keep_ratio: float,
     sft_selection_min_keep: int,
@@ -4413,6 +4798,44 @@ def finetune_qwen(
         followup_paraphrase_aug=int(sft_followup_paraphrase_aug),
         followup_paraphrase_weight=float(sft_followup_paraphrase_weight),
     )
+    sft_rows_before_packing = int(len(train_rows))
+    sft_supervised_tokens_before_packing = int(
+        sum(_row_supervised_token_count(row) for row in train_rows)
+    )
+    if bool(sft_true_packing):
+        separator_token_id = getattr(tokenizer, "eos_token_id", None)
+        if separator_token_id is None:
+            separator_token_id = getattr(tokenizer, "pad_token_id", 0)
+        train_rows = _pack_sft_rows(
+            train_rows,
+            max_length=max_length,
+            separator_token_id=int(separator_token_id if separator_token_id is not None else 0),
+            max_samples_per_row=int(sft_packing_max_samples_per_row),
+        )
+        packed_rows_multi = sum(
+            1 for row in train_rows if int(row.get("packed_sample_count", 1)) > 1
+        )
+        packed_ratio = float(len(train_rows)) / float(max(1, sft_rows_before_packing))
+        avg_samples = sum(int(row.get("packed_sample_count", 1)) for row in train_rows) / float(
+            max(1, len(train_rows))
+        )
+        print(
+            "[sft] true packing: "
+            f"rows_before={sft_rows_before_packing} rows_after={len(train_rows)} "
+            f"packed_rows={packed_rows_multi} avg_samples_per_row={avg_samples:.2f} "
+            f"compression={packed_ratio:.3f}"
+        )
+    sft_rows_after_packing = int(len(train_rows))
+    sft_supervised_tokens_after_packing = int(
+        sum(_row_supervised_token_count(row) for row in train_rows)
+    )
+    sft_packed_rows = int(sum(1 for row in train_rows if int(row.get("packed_sample_count", 1)) > 1))
+    sft_avg_samples_per_row = float(
+        sum(int(row.get("packed_sample_count", 1)) for row in train_rows) / float(max(1, len(train_rows)))
+    )
+    sft_median_train_sequence_tokens = float(
+        _median_numeric([int(row.get("sequence_tokens", len(row["input_ids"]))) for row in train_rows])
+    )
     dataset = PackedChatDataset(train_rows)
     loader = _build_bucketed_dataloader(
         dataset=dataset,
@@ -4456,6 +4879,15 @@ def finetune_qwen(
         ),
         last_epoch=resume_sft_steps - 1,
     )
+    restored_sft_training_state = False
+    if resume_sft_steps > 0:
+        restored_sft_training_state = _restore_checkpoint_training_state(
+            adapter_dir_or_checkpoint_dir=init_path,
+            stage="sft",
+            optimizer=optim,
+            scheduler=sft_scheduler,
+            device=device,
+        )
     # -- v28 improvements config --
     focal_gamma = max(0.0, float(sft_focal_gamma))
     eval_every = max(0, int(sft_eval_every_steps))
@@ -4506,10 +4938,16 @@ def finetune_qwen(
     t0 = time.time()
     optim.zero_grad(set_to_none=True)
     if steps > 0:
-        print(
-            "[resume] continuing SFT from adapter "
-            f"{init_path} at step={steps} (optimizer state is reinitialized)"
-        )
+        if restored_sft_training_state:
+            print(
+                "[resume] continuing SFT from adapter "
+                f"{init_path} at step={steps} (optimizer/scheduler state restored)"
+            )
+        else:
+            print(
+                "[resume] continuing SFT from adapter "
+                f"{init_path} at step={steps} (optimizer state is reinitialized)"
+            )
 
     if bool(skip_sft):
         print("[train] skipping SFT stage (--skip_sft).")
@@ -4521,7 +4959,21 @@ def finetune_qwen(
                     "attention_mask": batch["attention_mask"].to(device),
                     "labels": batch["labels"].to(device),
                 }
-                sample_weights = batch.get("weights")
+                segment_count = batch.get("segment_count")
+                segment_lengths = batch.get("segment_lengths")
+                segment_weights = batch.get("segment_weights")
+                if segment_count is not None:
+                    segment_count = segment_count.to(device)
+                if segment_lengths is not None:
+                    segment_lengths = segment_lengths.to(device)
+                sample_weights = None
+                if segment_weights is not None and segment_count is not None:
+                    sample_weights = _flatten_packed_segment_values(
+                        segment_weights.to(device).float(),
+                        segment_count,
+                    )
+                else:
+                    sample_weights = batch.get("weights")
                 if sample_weights is not None:
                     sample_weights = sample_weights.to(device).float()
                     # Curriculum quality ramp: linearly reduce weight of lower-quality
@@ -4545,7 +4997,15 @@ def finetune_qwen(
                     input_ids=model_batch["input_ids"],
                     attention_mask=model_batch["attention_mask"],
                 )
-                seq_logp, _ = _sequence_average_log_prob(out.logits, model_batch["labels"])
+                if segment_lengths is not None and segment_count is not None:
+                    seq_logp, _ = _packed_segment_average_log_prob(
+                        out.logits,
+                        model_batch["labels"],
+                        segment_lengths=segment_lengths,
+                        segment_count=segment_count,
+                    )
+                else:
+                    seq_logp, _ = _sequence_average_log_prob(out.logits, model_batch["labels"])
                 seq_loss = -seq_logp
 
                 # Focal loss: down-weight easy samples, up-weight hard ones.
@@ -4564,13 +5024,30 @@ def finetune_qwen(
                         input_ids=model_batch["input_ids"],
                         attention_mask=model_batch["attention_mask"],
                     )
-                    seq_logp_b, _ = _sequence_average_log_prob(out_b.logits, model_batch["labels"])
+                    if segment_lengths is not None and segment_count is not None:
+                        seq_logp_b, _ = _packed_segment_average_log_prob(
+                            out_b.logits,
+                            model_batch["labels"],
+                            segment_lengths=segment_lengths,
+                            segment_count=segment_count,
+                        )
+                    else:
+                        seq_logp_b, _ = _sequence_average_log_prob(out_b.logits, model_batch["labels"])
                     seq_loss_b = -seq_logp_b
                     base_loss = 0.5 * (
                         _weighted_mean(seq_loss, sample_weights)
                         + _weighted_mean(seq_loss_b, sample_weights)
                     )
-                    rdrop_term = _symmetric_token_kl(out.logits, out_b.logits, model_batch["labels"])
+                    if segment_lengths is not None and segment_count is not None:
+                        rdrop_term = _packed_segment_symmetric_token_kl(
+                            out.logits,
+                            out_b.logits,
+                            model_batch["labels"],
+                            segment_lengths=segment_lengths,
+                            segment_count=segment_count,
+                        )
+                    else:
+                        rdrop_term = _symmetric_token_kl(out.logits, out_b.logits, model_batch["labels"])
                     rdrop_value = _weighted_mean(rdrop_term, sample_weights)
                     loss_value = base_loss + float(sft_rdrop_alpha) * rdrop_value
                     sft_rdrop_sum += float(rdrop_value.item())
@@ -4605,11 +5082,18 @@ def finetune_qwen(
                         ckpt_adapter_dir.parent.mkdir(parents=True, exist_ok=True)
                         model.save_pretrained(ckpt_adapter_dir)
                         tokenizer.save_pretrained(ckpt_adapter_dir)
+                        trainer_state_path = _save_checkpoint_training_state(
+                            adapter_dir_or_checkpoint_dir=ckpt_adapter_dir,
+                            stage="sft",
+                            optimizer=optim,
+                            scheduler=sft_scheduler,
+                        )
                         checkpoint_meta = {
                             "stage": "sft",
                             "sft_steps": int(steps),
                             "sft_loss_mean": float(sft_loss_sum / max(1, steps)),
                             "checkpoint_adapter_dir": str(ckpt_adapter_dir),
+                            "checkpoint_training_state_path": str(trainer_state_path),
                         }
                         (ckpt_adapter_dir.parent / "checkpoint_meta.json").write_text(
                             json.dumps(checkpoint_meta, indent=2),
@@ -4662,11 +5146,18 @@ def finetune_qwen(
             ckpt_adapter_dir.parent.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(ckpt_adapter_dir)
             tokenizer.save_pretrained(ckpt_adapter_dir)
+            trainer_state_path = _save_checkpoint_training_state(
+                adapter_dir_or_checkpoint_dir=ckpt_adapter_dir,
+                stage="sft",
+                optimizer=optim,
+                scheduler=sft_scheduler,
+            )
             checkpoint_meta = {
                 "stage": "sft",
                 "sft_steps": int(steps),
                 "sft_loss_mean": float(sft_loss_sum / max(1, steps)),
                 "checkpoint_adapter_dir": str(ckpt_adapter_dir),
+                "checkpoint_training_state_path": str(trainer_state_path),
             }
             (ckpt_adapter_dir.parent / "checkpoint_meta.json").write_text(
                 json.dumps(checkpoint_meta, indent=2),
@@ -4857,13 +5348,28 @@ def finetune_qwen(
                 ),
                 last_epoch=max(-1, pref_steps_done - 1),
             )
+            restored_pref_training_state = False
+            if pref_steps_done > 0:
+                restored_pref_training_state = _restore_checkpoint_training_state(
+                    adapter_dir_or_checkpoint_dir=init_path,
+                    stage="preference",
+                    optimizer=pref_optim,
+                    scheduler=pref_scheduler,
+                    device=device,
+                )
             pref_optim.zero_grad(set_to_none=True)
             model.train()
             if pref_steps_done > 0:
-                print(
-                    "[resume] continuing preference stage from adapter "
-                    f"{init_path} at step={pref_steps_done} (optimizer state is reinitialized)"
-                )
+                if restored_pref_training_state:
+                    print(
+                        "[resume] continuing preference stage from adapter "
+                        f"{init_path} at step={pref_steps_done} (optimizer/scheduler state restored)"
+                    )
+                else:
+                    print(
+                        "[resume] continuing preference stage from adapter "
+                        f"{init_path} at step={pref_steps_done} (optimizer state is reinitialized)"
+                    )
 
             target_steps = max(1, int(preference_steps))
             pref_accum = 0
@@ -5057,12 +5563,19 @@ def finetune_qwen(
                         ckpt_adapter_dir.parent.mkdir(parents=True, exist_ok=True)
                         model.save_pretrained(ckpt_adapter_dir)
                         tokenizer.save_pretrained(ckpt_adapter_dir)
+                        trainer_state_path = _save_checkpoint_training_state(
+                            adapter_dir_or_checkpoint_dir=ckpt_adapter_dir,
+                            stage="preference",
+                            optimizer=pref_optim,
+                            scheduler=pref_scheduler,
+                        )
                         checkpoint_meta = {
                             "stage": "preference",
                             "sft_steps": int(steps),
                             "preference_steps": int(pref_steps_done),
                             "preference_loss_mean": float(pref_loss_sum / max(1, pref_steps_done)),
                             "checkpoint_adapter_dir": str(ckpt_adapter_dir),
+                            "checkpoint_training_state_path": str(trainer_state_path),
                         }
                         (ckpt_adapter_dir.parent / "checkpoint_meta.json").write_text(
                             json.dumps(checkpoint_meta, indent=2),
@@ -5082,12 +5595,19 @@ def finetune_qwen(
                 ckpt_adapter_dir.parent.mkdir(parents=True, exist_ok=True)
                 model.save_pretrained(ckpt_adapter_dir)
                 tokenizer.save_pretrained(ckpt_adapter_dir)
+                trainer_state_path = _save_checkpoint_training_state(
+                    adapter_dir_or_checkpoint_dir=ckpt_adapter_dir,
+                    stage="preference",
+                    optimizer=pref_optim,
+                    scheduler=pref_scheduler,
+                )
                 checkpoint_meta = {
                     "stage": "preference",
                     "sft_steps": int(steps),
                     "preference_steps": int(pref_steps_done),
                     "preference_loss_mean": float(pref_loss_sum / max(1, pref_steps_done)),
                     "checkpoint_adapter_dir": str(ckpt_adapter_dir),
+                    "checkpoint_training_state_path": str(trainer_state_path),
                 }
                 (ckpt_adapter_dir.parent / "checkpoint_meta.json").write_text(
                     json.dumps(checkpoint_meta, indent=2),
@@ -5140,6 +5660,15 @@ def finetune_qwen(
         "sft_lr_restart_period": float(int(sft_lr_restart_period)),
         "sft_length_bucketed_batches": bool(sft_length_bucketed_batches),
         "sft_length_bucket_window_mult": float(max(2, int(sft_length_bucket_window_mult))),
+        "sft_true_packing": bool(sft_true_packing),
+        "sft_packing_max_samples_per_row": float(max(0, int(sft_packing_max_samples_per_row))),
+        "sft_rows_before_packing": float(sft_rows_before_packing),
+        "sft_rows_after_packing": float(sft_rows_after_packing),
+        "sft_packed_rows": float(sft_packed_rows),
+        "sft_avg_samples_per_row": float(sft_avg_samples_per_row),
+        "sft_supervised_tokens_before_packing": float(sft_supervised_tokens_before_packing),
+        "sft_supervised_tokens_after_packing": float(sft_supervised_tokens_after_packing),
+        "sft_median_train_sequence_tokens": float(sft_median_train_sequence_tokens),
         "sft_selection_strategy": str(sft_selection_strategy).strip().lower(),
         "sft_selection_keep_ratio": float(max(0.0, min(1.0, sft_selection_keep_ratio))),
         "sft_selection_min_keep": float(max(0, int(sft_selection_min_keep))),
@@ -5410,6 +5939,9 @@ def save_jsonl(path: Path, pairs: Sequence[ChatPair]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for pair in pairs:
             row = {"user": pair.user, "assistant": pair.assistant, "source": pair.source}
+            metadata = _normalize_chat_pair_metadata(pair.metadata)
+            if metadata:
+                row["metadata"] = metadata
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
@@ -5559,11 +6091,15 @@ def load_saved_chat_pairs(path: Path) -> List[ChatPair]:
             assistant = _coerce_text(record.get("assistant"))
             if not user or not assistant:
                 continue
+            metadata = _normalize_chat_pair_metadata(record.get("metadata"))
+            if not metadata:
+                metadata = _extract_chat_pair_metadata(record)
             pairs.append(
                 ChatPair(
                     user=user,
                     assistant=assistant,
                     source=_coerce_text(record.get("source")) or "dataset",
+                    metadata=metadata,
                 )
             )
     return pairs
@@ -5670,6 +6206,90 @@ def _merge_distillation_pairs(
         added += 1
     random.Random(seed).shuffle(mixed)
     return mixed, added
+
+
+def _checkpoint_training_state_path(adapter_dir_or_checkpoint_dir: Path) -> Path:
+    checkpoint_dir = Path(adapter_dir_or_checkpoint_dir)
+    if checkpoint_dir.name.strip().lower() == "adapter":
+        checkpoint_dir = checkpoint_dir.parent
+    return checkpoint_dir / "trainer_state.pt"
+
+
+def _move_state_value_to_device(value: object, device: Any) -> object:
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {k: _move_state_value_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_state_value_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_state_value_to_device(v, device) for v in value)
+    return value
+
+
+def _move_optimizer_state_to_device(optimizer, device: Any) -> None:
+    for state_key, state_value in list(optimizer.state.items()):
+        optimizer.state[state_key] = _move_state_value_to_device(state_value, device)
+
+
+def _save_checkpoint_training_state(
+    adapter_dir_or_checkpoint_dir: Path,
+    stage: str,
+    optimizer,
+    scheduler=None,
+) -> Path:
+    state_path = _checkpoint_training_state_path(adapter_dir_or_checkpoint_dir)
+    payload = {
+        "stage": str(stage).strip().lower() or "sft",
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+    }
+    torch.save(payload, state_path)
+    return state_path
+
+
+def _restore_checkpoint_training_state(
+    adapter_dir_or_checkpoint_dir: Optional[Path],
+    stage: str,
+    optimizer,
+    scheduler,
+    device: Any,
+) -> bool:
+    if adapter_dir_or_checkpoint_dir is None:
+        return False
+    state_path = _checkpoint_training_state_path(Path(adapter_dir_or_checkpoint_dir))
+    if not state_path.exists():
+        return False
+    try:
+        payload = torch.load(state_path, map_location="cpu")
+    except Exception as e:
+        print(f"[resume] failed to load training state {state_path}: {e}")
+        return False
+    if not isinstance(payload, dict):
+        print(f"[resume] invalid training state payload at {state_path}")
+        return False
+    payload_stage = str(payload.get("stage") or "").strip().lower()
+    expected_stage = str(stage or "").strip().lower() or "sft"
+    if payload_stage and payload_stage != expected_stage:
+        print(
+            "[resume] training state stage mismatch: "
+            f"expected={expected_stage} found={payload_stage} path={state_path}"
+        )
+        return False
+    optimizer_state = payload.get("optimizer_state")
+    if not isinstance(optimizer_state, dict):
+        print(f"[resume] missing optimizer_state in {state_path}")
+        return False
+    try:
+        optimizer.load_state_dict(optimizer_state)
+        _move_optimizer_state_to_device(optimizer, device)
+        scheduler_state = payload.get("scheduler_state")
+        if scheduler is not None and isinstance(scheduler_state, dict):
+            scheduler.load_state_dict(scheduler_state)
+    except Exception as e:
+        print(f"[resume] failed to restore training state from {state_path}: {e}")
+        return False
+    return True
 
 
 def _read_resume_checkpoint(meta_path: Path) -> Optional[ResumeCheckpoint]:
@@ -5833,6 +6453,12 @@ def parse_args() -> argparse.Namespace:
         help="Log dataset loading progress every N accepted pairs (0 disables).",
     )
     ap.add_argument("--eval_size", type=int, default=64)
+    ap.add_argument(
+        "--eval_split_mode",
+        choices=["auto", "random"],
+        default="auto",
+        help="Use metadata-aware grouped eval splits when possible, otherwise random.",
+    )
     ap.add_argument(
         "--eval_min_quality_score",
         type=float,
@@ -6057,6 +6683,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Window multiplier used for SFT length bucketing.",
+    )
+    ap.add_argument(
+        "--sft_true_packing",
+        action="store_true",
+        help="Pack multiple SFT train sequences into each row with masked separators for higher token utilization.",
+    )
+    ap.add_argument(
+        "--sft_packing_max_samples_per_row",
+        type=int,
+        default=0,
+        help="Optional cap on the number of original SFT samples packed into one train row (0 disables the cap).",
     )
     ap.add_argument(
         "--sft_selection_strategy",
@@ -6722,6 +7359,7 @@ def main() -> None:
         "max_prompt_signature_count": int(args.max_prompt_signature_count),
         "prompt_signature_cap_exempt_sources": sorted(prompt_sig_exempt_sources),
         "eval_size": int(args.eval_size),
+        "eval_split_mode": str(args.eval_split_mode),
         "eval_min_quality_score": float(args.eval_min_quality_score),
         "eval_drop_synthetic_prompts": bool(args.eval_drop_synthetic_prompts),
         "seed": int(args.seed),
@@ -6746,7 +7384,12 @@ def main() -> None:
             log_every_records=int(args.data_log_every_records),
         )
         print(f"[data] loaded={len(all_pairs)}")
-        train_pairs, eval_pairs = split_train_eval(all_pairs, eval_size=int(args.eval_size), seed=int(args.seed))
+        train_pairs, eval_pairs = split_train_eval(
+            all_pairs,
+            eval_size=int(args.eval_size),
+            seed=int(args.seed),
+            split_mode=str(args.eval_split_mode),
+        )
         raw_eval_count = len(eval_pairs)
         eval_pairs = filter_eval_pairs(
             eval_pairs,
@@ -6881,6 +7524,8 @@ def main() -> None:
         sft_grad_noise_eta=float(args.sft_grad_noise_eta),
         sft_length_bucketed_batches=bool(args.sft_length_bucketed_batches),
         sft_length_bucket_window_mult=int(args.sft_length_bucket_window_mult),
+        sft_true_packing=bool(args.sft_true_packing),
+        sft_packing_max_samples_per_row=int(args.sft_packing_max_samples_per_row),
         sft_selection_strategy=str(args.sft_selection_strategy),
         sft_selection_keep_ratio=float(args.sft_selection_keep_ratio),
         sft_selection_min_keep=int(args.sft_selection_min_keep),
@@ -7030,6 +7675,7 @@ def main() -> None:
             "data_log_every_records": int(args.data_log_every_records),
             "prompt_signature_cap_exempt_sources": prompt_sig_exempt_sources,
             "eval_size": int(args.eval_size),
+            "eval_split_mode": str(args.eval_split_mode),
             "eval_min_quality_score": float(args.eval_min_quality_score),
             "eval_drop_synthetic_prompts": bool(args.eval_drop_synthetic_prompts),
             "max_steps": int(args.max_steps),
@@ -7087,6 +7733,8 @@ def main() -> None:
             "sft_grad_noise_eta": float(args.sft_grad_noise_eta),
             "sft_length_bucketed_batches": bool(args.sft_length_bucketed_batches),
             "sft_length_bucket_window_mult": int(args.sft_length_bucket_window_mult),
+            "sft_true_packing": bool(args.sft_true_packing),
+            "sft_packing_max_samples_per_row": int(args.sft_packing_max_samples_per_row),
             "sft_selection_strategy": str(args.sft_selection_strategy),
             "sft_selection_keep_ratio": float(args.sft_selection_keep_ratio),
             "sft_selection_min_keep": int(args.sft_selection_min_keep),

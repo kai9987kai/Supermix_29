@@ -11,25 +11,7 @@ import qwen_supermix_pipeline as qp
 
 
 def _load_eval_pairs_from_jsonl(path: Path) -> List[qp.ChatPair]:
-    pairs: List[qp.ChatPair] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            raw = line.strip()
-            if not raw:
-                continue
-            row = json.loads(raw)
-            user = str(row.get("user", "")).strip()
-            assistant = str(row.get("assistant", "")).strip()
-            if not user or not assistant:
-                continue
-            pairs.append(
-                qp.ChatPair(
-                    user=user,
-                    assistant=assistant,
-                    source=str(row.get("source", "eval")),
-                )
-            )
-    return pairs
+    return qp.load_saved_chat_pairs(path)
 
 
 def _numeric_deltas(base: Dict[str, float], tuned: Dict[str, float]) -> Dict[str, float]:
@@ -57,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--max_records", type=int, default=480)
     ap.add_argument("--eval_size", type=int, default=64)
+    ap.add_argument("--eval_split_mode", choices=["auto", "random"], default="auto")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max_eval_samples", type=int, default=0, help="0 keeps all eval rows")
     ap.add_argument("--max_length", type=int, default=256)
@@ -97,6 +80,7 @@ def main() -> None:
             pairs=all_pairs,
             eval_size=max(1, int(args.eval_size)),
             seed=int(args.seed),
+            split_mode=str(args.eval_split_mode),
         )
     else:
         raise ValueError("Provide either --eval_jsonl or --data.")
@@ -149,6 +133,7 @@ def main() -> None:
             "eval_source": str(eval_source) if eval_source is not None else "split_from_data",
             "eval_samples": int(len(eval_pairs)),
             "seed": int(args.seed),
+            "eval_split_mode": str(args.eval_split_mode),
             "max_length": int(args.max_length),
             "max_new_tokens": int(args.max_new_tokens),
             "max_records": int(args.max_records),

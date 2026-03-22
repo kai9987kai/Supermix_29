@@ -422,3 +422,16 @@
 [distill] progress: visited=5440/8000 generated=1239 rate=1.68/s
 [distill] progress: visited=5480/8000 generated=1244 rate=1.69/s
 [distill] progress: visited=5520/8000 generated=1253 rate=1.69/s
+[runtime] device resolve: requested=auto preference=cuda,npu,xpu,mps,cpu,dml resolved=cpu device=cpu
+[runtime] requested=auto resolved=cpu device=cpu model_dtype=torch.float32 gradient_checkpointing=True strict_determinism=False torch_threads=8 interop_threads=4 preference=cuda,npu,xpu,mps,cpu,dml
+[data] loading Supermix pairs...
+[data] sources=6 -> conversation_data.quality_anchor_v2.jsonl, conversation_data.coding_knowledge_2026_02_19.jsonl, conversation_data.world_events_2026_02_19.jsonl, conversation_data.supermix_plus_v27_500k.jsonl, conversation_data.mega_reasoning_creative_v25_75582.jsonl, conversation_data.mega_creative_250k_v2.jsonl
+[data] progress: pairs=2000/600000 raw=3512 kept=2631 rate=462.23/s
+[data] progress: pairs=4000/600000 raw=8085 kept=5710 rate=364.39/s
+[data] progress: pairs=6000/600000 raw=12894 kept=8853 rate=342.28/s
+[data] progress: pairs=8000/600000 raw=17862 kept=12087 rate=327.48/s
+[data] progress: pairs=10000/600000 raw=23198 kept=15412 rate=310.67/s
+[data] progress: pairs=12000/600000 raw=28702 kept=18877 rate=294.67/s
+[data] progress: pairs=14000/600000 raw=34489 kept=22447 rate=287.83/s
+[data] progress: pairs=16000/600000 raw=40703 kept=26243 rate=275.51/s
+[data] progress: pairs=18000/600000 raw=46981 kept=29970 rate=268.67/s

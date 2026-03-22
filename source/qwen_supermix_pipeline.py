@@ -4602,6 +4602,7 @@ def finetune_qwen(
     preference_length_bucket_window_mult: int,
     seed: int,
     save_every_steps: int,
+    keep_last_checkpoints: int,
     preference_rescore_every: int,
     skip_sft: bool,
     init_adapter_match_lora: bool,
@@ -5104,6 +5105,7 @@ def finetune_qwen(
                             encoding="utf-8",
                         )
                         print(f"[checkpoint] saved stage=sft step={steps} -> {ckpt_adapter_dir}")
+                        _prune_checkpoint_dirs(output_dir, keep_last_checkpoints)
                     # Eval monitoring with optional early stopping.
                     if eval_every > 0 and eval_loader is not None and steps % eval_every == 0:
                         model.eval()
@@ -5168,6 +5170,7 @@ def finetune_qwen(
                 encoding="utf-8",
             )
             print(f"[checkpoint] saved stage=sft step={steps} -> {ckpt_adapter_dir}")
+            _prune_checkpoint_dirs(output_dir, keep_last_checkpoints)
 
     noise_hook = _replace_neftune_hook(
         model=model,
@@ -5586,6 +5589,7 @@ def finetune_qwen(
                             encoding="utf-8",
                         )
                         print(f"[checkpoint] saved stage=preference step={pref_steps_done} -> {ckpt_adapter_dir}")
+                        _prune_checkpoint_dirs(output_dir, keep_last_checkpoints)
                     if pref_steps_done >= target_steps:
                         break
                 if pref_steps_done >= target_steps:
@@ -5618,6 +5622,7 @@ def finetune_qwen(
                     encoding="utf-8",
                 )
                 print(f"[checkpoint] saved stage=preference step={pref_steps_done} -> {ckpt_adapter_dir}")
+                _prune_checkpoint_dirs(output_dir, keep_last_checkpoints)
 
     if noise_hook is not None:
         noise_hook.remove()
@@ -5753,6 +5758,7 @@ def finetune_qwen(
         "preference_neftune_noise_alpha": float(preference_neftune_noise_alpha),
         "init_adapter_match_lora": bool(init_adapter_match_lora),
         "save_every_steps": float(checkpoint_every),
+        "keep_last_checkpoints": float(max(0, int(keep_last_checkpoints))),
         "skip_sft": bool(skip_sft),
     }
     return adapter_dir, stats
@@ -6318,6 +6324,36 @@ def _read_resume_checkpoint(meta_path: Path) -> Optional[ResumeCheckpoint]:
     )
 
 
+def _prune_checkpoint_dirs(output_dir: Path, keep_last_checkpoints: int) -> None:
+    keep = max(0, int(keep_last_checkpoints))
+    if keep <= 0:
+        return
+    checkpoints_dir = Path(output_dir) / "checkpoints"
+    if not checkpoints_dir.exists():
+        return
+    ranked: List[Tuple[Tuple[int, int, float], Path]] = []
+    for meta_path in checkpoints_dir.glob("*/checkpoint_meta.json"):
+        state = _read_resume_checkpoint(meta_path)
+        if state is None:
+            continue
+        try:
+            mtime = float(meta_path.stat().st_mtime)
+        except OSError:
+            mtime = -1.0
+        stage_rank = 1 if state.stage == "preference" else 0
+        step_rank = int(state.preference_steps if state.stage == "preference" else state.sft_steps)
+        ranked.append(((stage_rank, step_rank, mtime), meta_path.parent))
+    if len(ranked) <= keep:
+        return
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    for _, checkpoint_dir in ranked[keep:]:
+        try:
+            shutil.rmtree(checkpoint_dir)
+            print(f"[checkpoint] pruned old checkpoint -> {checkpoint_dir}")
+        except OSError as e:
+            print(f"[checkpoint] failed to prune {checkpoint_dir}: {e}")
+
+
 def _resolve_latest_resume_checkpoint(output_dir: Path) -> Optional[ResumeCheckpoint]:
     latest_ptr = output_dir / "latest_adapter_checkpoint.txt"
     if latest_ptr.exists():
@@ -6518,6 +6554,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Save adapter checkpoints every N optimizer steps across SFT/preference (0 disables).",
+    )
+    ap.add_argument(
+        "--keep_last_checkpoints",
+        type=int,
+        default=0,
+        help="Keep only the most recent N saved checkpoints under --output_dir/checkpoints (0 disables pruning).",
     )
     ap.add_argument(
         "--resume_sft_steps",
@@ -7330,6 +7372,8 @@ def main() -> None:
         )
         if explicit_resume_state is not None:
             resume_state = explicit_resume_state
+            if resume_state.stage == "preference":
+                args.skip_sft = True
             print(
                 "[resume] using explicit resume metadata: "
                 f"stage={resume_state.stage} "
@@ -7600,6 +7644,7 @@ def main() -> None:
         preference_length_bucket_window_mult=int(args.preference_length_bucket_window_mult),
         seed=int(args.seed),
         save_every_steps=int(args.save_every_steps),
+        keep_last_checkpoints=int(args.keep_last_checkpoints),
         preference_rescore_every=int(args.preference_rescore_every),
         skip_sft=bool(args.skip_sft),
         init_adapter_match_lora=bool(args.init_adapter_match_lora),
@@ -7687,6 +7732,7 @@ def main() -> None:
             "sft_max_grad_norm": float(args.sft_max_grad_norm),
             "train_log_every_steps": int(args.train_log_every_steps),
             "save_every_steps": int(args.save_every_steps),
+            "keep_last_checkpoints": int(args.keep_last_checkpoints),
             "skip_sft": bool(args.skip_sft),
             "supermix_distill_ratio": float(args.supermix_distill_ratio),
             "supermix_distill_max": int(args.supermix_distill_max),

@@ -66,6 +66,12 @@ def _import_progress_heartbeat_helper():
     return _should_log_progress_heartbeat
 
 
+def _import_preference_selection_helpers():
+    from source.qwen_supermix_pipeline import PreferencePair, _select_preference_pairs
+
+    return PreferencePair, _select_preference_pairs
+
+
 def _import_split_and_io_helpers():
     from source.qwen_supermix_pipeline import ChatPair, load_saved_chat_pairs, save_jsonl, split_train_eval
 
@@ -656,6 +662,131 @@ def test_sft_scoped_selection_only_trims_teacher_subset():
     print("  [ok] scoped selection only trims teacher subset")
 
 
+def test_sft_coverage_selection_keeps_rare_high_quality_group():
+    (
+        _build_lr_lambda,
+        _LengthBucketBatchSampler,
+        _pair_knowledge_density_score,
+        _select_sft_training_pairs,
+        _counterfactual_reject_variants,
+        ChatPair,
+    ) = _import_pipeline()
+    pairs = [
+        ChatPair(
+            user="Explain binary search step by step and give the time complexity.",
+            assistant=(
+                "Check the midpoint, discard the half that cannot contain the target, and repeat. "
+                "Because each comparison halves the remaining range, binary search runs in O(log n) time."
+            ),
+            source="conversation_data.coding_knowledge_2026_02_19.jsonl",
+        ),
+        ChatPair(
+            user="Explain merge sort step by step and give the time complexity.",
+            assistant=(
+                "Split the array recursively, sort each half, and merge the sorted halves. "
+                "The merge work is linear per level, so merge sort runs in O(n log n) time."
+            ),
+            source="conversation_data.coding_knowledge_2026_02_19.jsonl",
+        ),
+        ChatPair(
+            user="What happened on July 20, 1969?",
+            assistant="Apollo 11 landed on the Moon, and Neil Armstrong became the first person to walk on it.",
+            source="conversation_data.world_events_2026_02_19.jsonl",
+            metadata={"event_id": "apollo_11_moon_landing", "topic": "space_history"},
+        ),
+    ]
+    utility_selected = _select_sft_training_pairs(
+        pairs,
+        strategy="utility_topk",
+        keep_ratio=0.67,
+        min_keep=0,
+        max_keep=0,
+        hardness_target=0.56,
+        hardness_bandwidth=0.30,
+    )
+    coverage_selected = _select_sft_training_pairs(
+        pairs,
+        strategy="coverage_topk",
+        keep_ratio=0.67,
+        min_keep=0,
+        max_keep=0,
+        hardness_target=0.56,
+        hardness_bandwidth=0.30,
+    )
+    utility_answers = {pair.assistant for pair in utility_selected}
+    coverage_answers = {pair.assistant for pair in coverage_selected}
+    assert pairs[2].assistant not in utility_answers, "Plain utility selection should prefer the denser duplicate coding cluster"
+    assert pairs[2].assistant in coverage_answers, "Coverage-aware selection should preserve the rarer grouped event sample"
+    print("  [ok] coverage_topk preserves rare high-quality grouped sample")
+
+
+def test_preference_coverage_margin_preserves_style_diversity():
+    PreferencePair, _select_preference_pairs = _import_preference_selection_helpers()
+    pairs = [
+        PreferencePair(
+            user="Explain binary search and why it is O(log n).",
+            chosen="Binary search compares the midpoint, discards the impossible half, and repeats until done.",
+            rejected="Binary search is helpful and efficient in many practical cases.",
+            weight=1.25,
+            quality_gap=0.36,
+            rejected_similarity=0.46,
+            prompt_complexity=0.68,
+            conversation_score=0.20,
+            reasoning_score=0.82,
+            creativity_score=0.08,
+            knowledge_density_score=0.88,
+        ),
+        PreferencePair(
+            user="Explain merge sort and why it is O(n log n).",
+            chosen="Merge sort recursively splits the array, sorts each half, and merges them in linear time per level.",
+            rejected="Merge sort is a useful algorithm that is often fast and important.",
+            weight=1.22,
+            quality_gap=0.34,
+            rejected_similarity=0.44,
+            prompt_complexity=0.66,
+            conversation_score=0.18,
+            reasoning_score=0.79,
+            creativity_score=0.06,
+            knowledge_density_score=0.86,
+        ),
+        PreferencePair(
+            user="Write a creative but concise reflection on learning algorithms.",
+            chosen="Learning algorithms feels like turning confusion into structure, one insight at a time.",
+            rejected="Learning algorithms is good and can help people in many situations.",
+            weight=1.18,
+            quality_gap=0.30,
+            rejected_similarity=0.40,
+            prompt_complexity=0.60,
+            conversation_score=0.58,
+            reasoning_score=0.22,
+            creativity_score=0.94,
+            knowledge_density_score=0.28,
+        ),
+    ]
+    margin_selected = _select_preference_pairs(
+        pairs,
+        strategy="margin_topk",
+        keep_ratio=0.67,
+        min_keep=0,
+        max_keep=0,
+        hardness_target=0.45,
+        hardness_bandwidth=0.22,
+    )
+    coverage_selected = _select_preference_pairs(
+        pairs,
+        strategy="coverage_margin",
+        keep_ratio=0.67,
+        min_keep=0,
+        max_keep=0,
+        hardness_target=0.45,
+        hardness_bandwidth=0.22,
+    )
+    creative_prompt = pairs[2].user
+    assert creative_prompt not in {pair.user for pair in margin_selected}, "Margin selection should keep the stronger duplicate technical cluster"
+    assert creative_prompt in {pair.user for pair in coverage_selected}, "Coverage-aware preference selection should preserve the rarer creative pair"
+    print("  [ok] coverage_margin keeps style-diverse preference pairs")
+
+
 def test_benchmark_sample_comparison_ranks_worst_regressions_first():
     build_benchmark_sample_comparison = _import_benchmark_helpers()
     base_rows = [
@@ -813,6 +944,8 @@ def run_all():
         ("Compact reasoning rejects", test_counterfactual_rejects_include_compact_reasoning_variant),
         ("Token-budget SFT selection", test_sft_token_budget_prefers_dense_short_pairs),
         ("Scoped token-budget SFT selection", test_sft_scoped_selection_only_trims_teacher_subset),
+        ("Coverage-aware SFT selection", test_sft_coverage_selection_keeps_rare_high_quality_group),
+        ("Coverage-aware preference selection", test_preference_coverage_margin_preserves_style_diversity),
         ("Benchmark sample comparison", test_benchmark_sample_comparison_ranks_worst_regressions_first),
         ("Auto eval split grouping", test_split_train_eval_auto_groups_metadata_events),
         ("Chat-pair metadata roundtrip", test_save_jsonl_round_trips_pair_metadata),

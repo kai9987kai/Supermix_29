@@ -2923,7 +2923,7 @@ def _sft_pair_selection_score(
 
     score = utility
     mode_norm = str(mode).strip().lower()
-    if mode_norm == "capacity_aware":
+    if mode_norm in {"capacity_aware", "coverage_topk"}:
         bw = max(0.08, float(hardness_bandwidth))
         z = (difficulty - float(hardness_target)) / bw
         band = math.exp(-0.5 * z * z)
@@ -2931,6 +2931,7 @@ def _sft_pair_selection_score(
 
     return float(score), {
         "quality": float(quality_score),
+        "quality_signal": float(quality_signal),
         "density": float(density),
         "reasoning": float(reasoning_signal),
         "conversation": float(conversation_signal),
@@ -2950,6 +2951,99 @@ def _estimated_sft_pair_tokens(pair: ChatPair) -> int:
     user_tokens = max(1, _word_token_count(user_text))
     assistant_tokens = max(1, _word_token_count(assistant_text))
     return max(8, int(round(user_tokens * 1.10 + assistant_tokens * 1.05 + 6.0)))
+
+
+def _selection_rarity_bonus(count: int, total: int) -> float:
+    count_i = max(1, int(count))
+    total_i = max(1, int(total))
+    if total_i <= 1:
+        return 0.0
+    return float(
+        max(0.0, min(1.0, math.log1p(float(total_i) / float(count_i)) / math.log1p(float(total_i))))
+    )
+
+
+def _word_count_bucket(word_count: float) -> str:
+    words = max(1.0, float(word_count))
+    if words <= 24.0:
+        return "short"
+    if words <= 72.0:
+        return "medium"
+    if words <= 144.0:
+        return "long"
+    return "xlong"
+
+
+def _sft_pair_style_bucket(pair: ChatPair, metrics: Dict[str, float]) -> str:
+    if _looks_like_coding_prompt(pair.user):
+        return "coding"
+    style_scores = {
+        "reasoning": float(metrics.get("reasoning", 0.0)),
+        "knowledge": float(metrics.get("density", 0.0)),
+        "creative": float(metrics.get("creativity", 0.0)),
+        "conversation": float(metrics.get("conversation", 0.0)),
+    }
+    return max(style_scores.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def _apply_sft_coverage_topk_scores(
+    scored: Sequence[Tuple[float, float, ChatPair, Dict[str, float]]],
+    budget_mode: str,
+    budget_power: float,
+) -> List[Tuple[float, float, ChatPair, Dict[str, float]]]:
+    total = len(scored)
+    if total <= 1:
+        return list(scored)
+
+    source_counts: Dict[str, int] = {}
+    group_counts: Dict[str, int] = {}
+    style_counts: Dict[str, int] = {}
+    length_counts: Dict[str, int] = {}
+    keyed_rows: List[Tuple[str, str, str, str]] = []
+    for _budget_value, _score, pair, metrics in scored:
+        source_key = _split_group_token(Path(str(pair.source or "dataset")).name) or "dataset"
+        _group_type, raw_group_key = _chat_pair_split_group_key(pair)
+        group_key = raw_group_key or "ungrouped"
+        style_key = _sft_pair_style_bucket(pair, metrics)
+        length_key = _word_count_bucket(float(metrics.get("words", 0.0)))
+        keyed_rows.append((source_key, group_key, style_key, length_key))
+        source_counts[source_key] = source_counts.get(source_key, 0) + 1
+        group_counts[group_key] = group_counts.get(group_key, 0) + 1
+        style_counts[style_key] = style_counts.get(style_key, 0) + 1
+        length_counts[length_key] = length_counts.get(length_key, 0) + 1
+
+    adjusted: List[Tuple[float, float, ChatPair, Dict[str, float]]] = []
+    for (budget_value, score, pair, metrics), (source_key, group_key, style_key, length_key) in zip(scored, keyed_rows):
+        quality_signal = max(0.0, min(1.0, float(metrics.get("quality_signal", 0.0))))
+        source_rarity = _selection_rarity_bonus(source_counts.get(source_key, 1), total)
+        group_rarity = _selection_rarity_bonus(group_counts.get(group_key, 1), total)
+        style_rarity = _selection_rarity_bonus(style_counts.get(style_key, 1), total)
+        length_rarity = _selection_rarity_bonus(length_counts.get(length_key, 1), total)
+        diversity_bonus = (
+            0.10 * source_rarity
+            + 0.18 * group_rarity
+            + 0.08 * style_rarity
+            + 0.04 * length_rarity
+        ) * (0.60 + 0.40 * quality_signal)
+        adjusted_score = float(score) + float(diversity_bonus)
+        estimated_tokens = float(metrics.get("estimated_tokens", 0.0))
+        adjusted_budget = float(adjusted_score)
+        if str(budget_mode).strip().lower() == "tokens":
+            adjusted_budget = float(adjusted_score) / math.pow(max(8.0, estimated_tokens), float(budget_power))
+        next_metrics = dict(metrics)
+        next_metrics["source_key"] = source_key
+        next_metrics["group_key"] = group_key
+        next_metrics["style_key"] = style_key
+        next_metrics["length_key"] = length_key
+        next_metrics["source_rarity"] = float(source_rarity)
+        next_metrics["group_rarity"] = float(group_rarity)
+        next_metrics["style_rarity"] = float(style_rarity)
+        next_metrics["length_rarity"] = float(length_rarity)
+        next_metrics["diversity_bonus"] = float(diversity_bonus)
+        next_metrics["score"] = float(adjusted_score)
+        next_metrics["budget_value"] = float(adjusted_budget)
+        adjusted.append((float(adjusted_budget), float(adjusted_score), pair, next_metrics))
+    return adjusted
 
 
 def _is_scoped_sft_selection_pair(
@@ -2986,7 +3080,7 @@ def _select_sft_training_pairs(
     scope_min_words: int = 40,
 ) -> List[ChatPair]:
     mode = str(strategy).strip().lower()
-    if mode not in {"none", "utility_topk", "capacity_aware"}:
+    if mode not in {"none", "utility_topk", "capacity_aware", "coverage_topk"}:
         mode = "none"
     if mode == "none" or not pairs:
         return list(pairs)
@@ -3040,6 +3134,13 @@ def _select_sft_training_pairs(
             scored.append((float(budget_value), float(score), pair, metrics))
     if not scored:
         return list(pairs)
+
+    if mode == "coverage_topk":
+        scored = _apply_sft_coverage_topk_scores(
+            scored,
+            budget_mode=str(budget_mode),
+            budget_power=float(budget_power),
+        )
 
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     total = len(scored)
@@ -3105,6 +3206,17 @@ def _select_sft_training_pairs(
         f"est_tokens={total_estimated_tokens:.0f}->{selected_estimated_tokens:.0f} "
         f"budget_power={budget_power:.2f} "
         f"selected_score_mean={_mean('score', selected):.4f}"
+        + (
+            f" diversity_bonus={_mean('diversity_bonus', scored):.4f}->{_mean('diversity_bonus', selected):.4f} "
+            f"coverage_sources={len({str(entry[3].get('source_key', '')) for entry in scored})}"
+            f"->{len({str(entry[3].get('source_key', '')) for entry in selected})} "
+            f"coverage_groups={len({str(entry[3].get('group_key', '')) for entry in scored})}"
+            f"->{len({str(entry[3].get('group_key', '')) for entry in selected})} "
+            f"coverage_styles={len({str(entry[3].get('style_key', '')) for entry in scored})}"
+            f"->{len({str(entry[3].get('style_key', '')) for entry in selected})}"
+            if mode == "coverage_topk"
+            else ""
+        )
     )
     selected_ids = {id(pair) for _budget_value, _score, pair, _metrics in selected}
     return [pair for pair in pairs if id(pair) in passthrough_ids or id(pair) in selected_ids]
@@ -3670,7 +3782,95 @@ def _preference_selection_score(
             * (quality_gap + 0.12 * prompt_complexity + novelty_bonus + 0.05)
         )
 
+    if mode == "coverage_margin":
+        target = max(0.0, min(1.0, float(hardness_target)))
+        bw = max(0.05, float(hardness_bandwidth))
+        z = (rejected_similarity - target) / bw
+        hardness_window = math.exp(-0.5 * z * z)
+        novelty_bonus = (
+            0.10 * conversation_score
+            + 0.12 * reasoning_score
+            + 0.10 * creativity_score
+            + 0.12 * knowledge_density_score
+            + followup_bonus
+        )
+        return float(
+            base_weight
+            * (0.25 + 0.75 * hardness_window)
+            * (quality_gap + 0.14 * prompt_complexity + novelty_bonus + 0.05)
+        )
+
     return float(max(0.25, pair.weight))
+
+
+def _preference_pair_style_bucket(pair: PreferencePair) -> str:
+    if _looks_like_coding_prompt(pair.user):
+        return "coding"
+    style_scores = {
+        "reasoning": float(pair.reasoning_score),
+        "knowledge": float(pair.knowledge_density_score),
+        "creative": float(pair.creativity_score),
+        "conversation": float(pair.conversation_score),
+    }
+    return max(style_scores.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def _preference_pair_hardness_bucket(pair: PreferencePair) -> str:
+    similarity = max(0.0, min(1.0, float(pair.rejected_similarity)))
+    quality_gap = max(0.0, float(pair.quality_gap))
+    if similarity >= 0.72 and quality_gap <= 0.18:
+        return "near_miss"
+    if similarity >= 0.46:
+        return "hard"
+    if similarity >= 0.22:
+        return "mid"
+    return "easy"
+
+
+def _apply_preference_coverage_scores(
+    scored: Sequence[Tuple[float, PreferencePair]],
+) -> List[Tuple[float, PreferencePair]]:
+    total = len(scored)
+    if total <= 1:
+        return list(scored)
+
+    signature_counts: Dict[str, int] = {}
+    style_counts: Dict[str, int] = {}
+    hardness_counts: Dict[str, int] = {}
+    length_counts: Dict[str, int] = {}
+    keyed_rows: List[Tuple[str, str, str, str]] = []
+    for _score, pair in scored:
+        signature_key = _prompt_signature(pair.user)[:96] or "<empty>"
+        style_key = _preference_pair_style_bucket(pair)
+        hardness_key = _preference_pair_hardness_bucket(pair)
+        length_key = _word_count_bucket(
+            max(
+                _word_token_count(_fast_cleanup_response_text(pair.chosen)),
+                _word_token_count(_fast_cleanup_response_text(pair.rejected)),
+            )
+        )
+        keyed_rows.append((signature_key, style_key, hardness_key, length_key))
+        signature_counts[signature_key] = signature_counts.get(signature_key, 0) + 1
+        style_counts[style_key] = style_counts.get(style_key, 0) + 1
+        hardness_counts[hardness_key] = hardness_counts.get(hardness_key, 0) + 1
+        length_counts[length_key] = length_counts.get(length_key, 0) + 1
+
+    adjusted: List[Tuple[float, PreferencePair]] = []
+    for (score, pair), (signature_key, style_key, hardness_key, length_key) in zip(scored, keyed_rows):
+        signature_rarity = _selection_rarity_bonus(signature_counts.get(signature_key, 1), total)
+        style_rarity = _selection_rarity_bonus(style_counts.get(style_key, 1), total)
+        hardness_rarity = _selection_rarity_bonus(hardness_counts.get(hardness_key, 1), total)
+        length_rarity = _selection_rarity_bonus(length_counts.get(length_key, 1), total)
+        quality_anchor = 0.60 + 0.40 * min(1.0, max(0.0, float(pair.quality_gap)) / 0.45)
+        diversity_bonus = (
+            0.10 * signature_rarity
+            + 0.08 * style_rarity
+            + 0.08 * hardness_rarity
+            + 0.04 * length_rarity
+        ) * quality_anchor
+        pair.selection_score = float(score + diversity_bonus)
+        adjusted.append((float(pair.selection_score), pair))
+    return adjusted
 
 
 def _select_preference_pairs(
@@ -3686,7 +3886,7 @@ def _select_preference_pairs(
         return []
 
     mode = str(strategy or "none").strip().lower()
-    if mode not in {"none", "margin_topk", "capacity_aware", "innovation_mix"}:
+    if mode not in {"none", "margin_topk", "capacity_aware", "innovation_mix", "coverage_margin"}:
         mode = "none"
 
     keep_ratio = max(0.0, min(1.0, float(keep_ratio)))
@@ -3709,6 +3909,8 @@ def _select_preference_pairs(
         )
         pair.selection_score = float(score)
         scored.append((float(score), pair))
+    if mode == "coverage_margin":
+        scored = _apply_preference_coverage_scores(scored)
     scored.sort(key=lambda x: x[0], reverse=True)
 
     total = len(scored)
@@ -3749,6 +3951,14 @@ def _select_preference_pairs(
         f"creative={full_creative:.3f}->{sel_creative:.3f} "
         f"density={full_density:.3f}->{sel_density:.3f} "
         f"selected_score_mean={sel_score:.4f}"
+        + (
+            f" coverage_styles={len({_preference_pair_style_bucket(p) for p in pairs})}"
+            f"->{len({_preference_pair_style_bucket(p) for p in selected})} "
+            f"coverage_hardness={len({_preference_pair_hardness_bucket(p) for p in pairs})}"
+            f"->{len({_preference_pair_hardness_bucket(p) for p in selected})}"
+            if mode == "coverage_margin"
+            else ""
+        )
     )
     return selected
 
@@ -6739,7 +6949,7 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--sft_selection_strategy",
-        choices=["none", "utility_topk", "capacity_aware"],
+        choices=["none", "utility_topk", "capacity_aware", "coverage_topk"],
         default="none",
         help="Optional post-filter SFT pair selection strategy for faster, denser training.",
     )
@@ -7111,7 +7321,7 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--preference_selection_strategy",
-        choices=["none", "margin_topk", "capacity_aware", "innovation_mix"],
+        choices=["none", "margin_topk", "capacity_aware", "innovation_mix", "coverage_margin"],
         default="none",
         help="Post-mining preference-pair selection strategy for data curation.",
     )

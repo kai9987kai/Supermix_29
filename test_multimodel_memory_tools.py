@@ -1,7 +1,13 @@
 from pathlib import Path
 
 from source.multimodel_memory import ConversationMemoryStore
-from source.multimodel_tools import parse_tool_calls, should_offer_web_search, strip_tool_calls
+from source.multimodel_tools import (
+    parse_tool_calls,
+    parse_tool_requests,
+    should_offer_open_cmd,
+    should_offer_web_search,
+    strip_tool_calls,
+)
 
 
 def test_memory_store_extracts_facts_and_examples(tmp_path: Path) -> None:
@@ -29,7 +35,12 @@ def test_memory_store_extracts_facts_and_examples(tmp_path: Path) -> None:
 
 
 def test_tool_call_parsing_and_stripping() -> None:
-    text = "TOOL:web_search: latest OpenAI model docs\nThen summarize the result."
+    text = "TOOL:web_search: latest OpenAI model docs\nTOOL:open_cmd: C:\\work\nThen summarize the result."
     assert parse_tool_calls(text) == ["latest OpenAI model docs"]
+    assert parse_tool_requests(text) == [
+        {"name": "web_search", "argument": "latest OpenAI model docs"},
+        {"name": "open_cmd", "argument": "C:\\work"},
+    ]
     assert strip_tool_calls(text) == "Then summarize the result."
     assert should_offer_web_search("What is the latest OpenAI models page?")
+    assert should_offer_open_cmd("Please open Command Prompt for me.")

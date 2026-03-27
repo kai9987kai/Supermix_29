@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import html
+import os
 import re
+import subprocess
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Dict, List, Sequence
 
 
-TOOL_CALL_RE = re.compile(r"^\s*TOOL:web_search\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+WEB_TOOL_RE = re.compile(r"^\s*TOOL:web_search\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+CMD_TOOL_RE = re.compile(r"^\s*TOOL:open_cmd(?:\s*:\s*(.*?))?\s*$", re.IGNORECASE | re.MULTILINE)
 AUTO_WEB_RE = re.compile(
     r"\b(latest|recent|today|current|news|look up|lookup|search|web|docs|documentation|version|release|price|who is|what is new)\b",
+    re.IGNORECASE,
+)
+AUTO_CMD_RE = re.compile(
+    r"\b(open cmd|open command prompt|open terminal|launch cmd|start command prompt)\b",
     re.IGNORECASE,
 )
 LITE_RESULT_RE = re.compile(
@@ -43,16 +50,36 @@ class ToolEvent:
 
 
 def parse_tool_calls(text: str) -> List[str]:
-    return [match.group(1).strip() for match in TOOL_CALL_RE.finditer(str(text or "")) if match.group(1).strip()]
+    return [match.group(1).strip() for match in WEB_TOOL_RE.finditer(str(text or "")) if match.group(1).strip()]
+
+
+def parse_tool_requests(text: str) -> List[Dict[str, str]]:
+    requests: List[Dict[str, str]] = []
+    cooked = str(text or "")
+    for match in WEB_TOOL_RE.finditer(cooked):
+        query = match.group(1).strip()
+        if query:
+            requests.append({"name": "web_search", "argument": query})
+    for match in CMD_TOOL_RE.finditer(cooked):
+        requests.append({"name": "open_cmd", "argument": str(match.group(1) or "").strip()})
+    return requests
 
 
 def strip_tool_calls(text: str) -> str:
-    lines = [line for line in str(text or "").splitlines() if not TOOL_CALL_RE.match(line)]
+    lines = [
+        line
+        for line in str(text or "").splitlines()
+        if not WEB_TOOL_RE.match(line) and not CMD_TOOL_RE.match(line)
+    ]
     return "\n".join(lines).strip()
 
 
 def should_offer_web_search(prompt: str) -> bool:
     return bool(AUTO_WEB_RE.search(str(prompt or "")))
+
+
+def should_offer_open_cmd(prompt: str) -> bool:
+    return bool(AUTO_CMD_RE.search(str(prompt or "")))
 
 
 def _clean_html_text(value: str) -> str:
@@ -121,9 +148,36 @@ class WebSearchTool:
         return ToolEvent(name="web_search", query=cooked_query, results=results[:max_results], source="duckduckgo")
 
 
+class CmdOpenTool:
+    def open(self, working_dir: str = "") -> ToolEvent:
+        cooked_dir = str(working_dir or "").strip()
+        target_dir = ""
+        if cooked_dir:
+            candidate = os.path.abspath(os.path.expanduser(cooked_dir))
+            if os.path.isdir(candidate):
+                target_dir = candidate
+        command = ["cmd.exe"]
+        if target_dir:
+            command = ["cmd.exe", "/K", f'cd /d "{target_dir}"']
+        subprocess.Popen(command)
+        result = {
+            "title": "Opened Command Prompt",
+            "url": target_dir,
+            "snippet": f"Working directory: {target_dir}" if target_dir else "Working directory: default",
+            "domain": "local-system",
+        }
+        return ToolEvent(name="open_cmd", query=target_dir or "default", results=[result], source="local_system")
+
+
 def format_tool_results(events: Sequence[ToolEvent]) -> str:
     blocks: List[str] = []
     for event in events:
+        if event.name == "open_cmd":
+            rows = [f"Command prompt action: {event.query or 'default'}"]
+            for item in event.results[:1]:
+                rows.append(item.get("snippet") or "Command Prompt opened.")
+            blocks.append("\n".join(rows))
+            continue
         rows = [f"Web search query: {event.query}"]
         for idx, item in enumerate(event.results[:5], start=1):
             title = item.get("title") or item.get("url") or "result"

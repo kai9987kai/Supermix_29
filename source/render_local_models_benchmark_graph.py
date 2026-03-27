@@ -8,7 +8,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,9 @@ class ArtifactSpec:
     note: str = ""
     recipe_eval_accuracy: Optional[float] = None
     score_source: str = "common"
+    specialist_summary_path: Optional[str] = None
+    specialist_metric_key: Optional[str] = None
+    specialist_metric_label: str = ""
 
 
 ARTIFACT_SPECS: Sequence[ArtifactSpec] = (
@@ -131,6 +134,14 @@ ARTIFACT_SPECS: Sequence[ArtifactSpec] = (
         note="Represents the v38 native-image line; fp16 zip is the same model family.",
     ),
     ArtifactSpec(
+        key="v38_native_xlite_fp16",
+        label="v38_native_xlite_fp16",
+        family="native_image",
+        filename_tokens=("champion_v38_native_image_xlite_single_checkpoint_model_fp16_20260327",),
+        common_row_key="v38_native_xlite",
+        note="Half-precision package of the same v38 XLite checkpoint.",
+    ),
+    ArtifactSpec(
         key="v39_final",
         label="v39_final",
         family="champion",
@@ -140,6 +151,42 @@ ARTIFACT_SPECS: Sequence[ArtifactSpec] = (
         score_source="recipe_eval_only",
         note="No common-benchmark run was completed after the pod lost credit. This marker is the finished v39 recipe holdout score (29/528).",
     ),
+    ArtifactSpec(
+        key="science_vision_micro_v1",
+        label="science_vision_micro_v1",
+        family="vision",
+        filename_tokens=("supermix_science_image_recognition_micro_v1_20260327",),
+        common_row_key=None,
+        score_source="specialist_only",
+        note="Specialist upload-image recognition model. Common text benchmarks are not applicable.",
+        specialist_summary_path="output/supermix_science_image_recognition_micro_v1_20260327/science_image_recognition_micro_v1_summary.json",
+        specialist_metric_key="val_accuracy",
+        specialist_metric_label="vision val",
+    ),
+    ArtifactSpec(
+        key="omni_collective_v1",
+        label="omni_collective_v1",
+        family="fusion",
+        filename_tokens=("supermix_omni_collective_v1_20260327",),
+        common_row_key=None,
+        score_source="specialist_only",
+        note="Local fused assistant model. Specialist metric uses its validation response accuracy.",
+        specialist_summary_path="output/supermix_omni_collective_v1_20260327/omni_collective_v1_summary.json",
+        specialist_metric_key="val_response_accuracy",
+        specialist_metric_label="omni val",
+    ),
+    ArtifactSpec(
+        key="math_equation_micro_v1",
+        label="math_equation_micro_v1",
+        family="math",
+        filename_tokens=("supermix_math_equation_micro_v1_20260327",),
+        common_row_key=None,
+        score_source="specialist_only",
+        note="Math specialist with exact symbolic routing. Specialist metric uses validation accuracy on the math intent set.",
+        specialist_summary_path="output/supermix_math_equation_micro_v1_20260327/math_equation_micro_v1_summary.json",
+        specialist_metric_key="val_accuracy",
+        specialist_metric_label="math val",
+    ),
 )
 
 
@@ -148,6 +195,27 @@ FAMILY_COLORS: Dict[str, str] = {
     "champion": "#2563eb",
     "native_image": "#15803d",
     "wrapper": "#6b7280",
+    "vision": "#7c3aed",
+    "fusion": "#db2777",
+    "math": "#0f766e",
+}
+
+BENCHMARK_ORDER: Sequence[str] = (
+    "arc_challenge",
+    "boolq",
+    "gsm8k",
+    "hellaswag",
+    "mmlu",
+    "piqa",
+)
+
+BENCHMARK_LABELS: Dict[str, str] = {
+    "arc_challenge": "ARC",
+    "boolq": "BoolQ",
+    "gsm8k": "GSM8K",
+    "hellaswag": "Hella",
+    "mmlu": "MMLU",
+    "piqa": "PIQA",
 }
 
 
@@ -166,6 +234,32 @@ def _safe_float(value: object) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _extract_nested(payload: Dict[str, object], dotted_key: str) -> Optional[float]:
+    current: object = payload
+    for part in dotted_key.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return _safe_float(current)
+
+
+def _load_specialist_metric(repo_root: Path, spec: ArtifactSpec) -> Tuple[Optional[float], str]:
+    if not spec.specialist_summary_path or not spec.specialist_metric_key:
+        return None, spec.specialist_metric_label
+    summary_path = (repo_root / spec.specialist_summary_path).resolve()
+    if not summary_path.exists():
+        return None, spec.specialist_metric_label
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    metric = _extract_nested(payload, spec.specialist_metric_key)
+    if metric is None and isinstance(payload.get("meta"), dict):
+        metric = _extract_nested(payload["meta"], spec.specialist_metric_key)
+    if metric is None and isinstance(payload.get("history"), list) and payload["history"]:
+        last_history = payload["history"][-1]
+        if isinstance(last_history, dict):
+            metric = _extract_nested(last_history, spec.specialist_metric_key)
+    return metric, spec.specialist_metric_label
 
 
 def _load_common_rows(summary_path: Path) -> Dict[str, Dict[str, object]]:
@@ -238,7 +332,7 @@ def build_zip_inventory(models_dir: Path, artifacts: Dict[str, Path]) -> Dict[st
     }
 
 
-def build_rows(models_dir: Path, common_summary_path: Path) -> List[Dict[str, object]]:
+def build_rows(models_dir: Path, common_summary_path: Path, repo_root: Path) -> List[Dict[str, object]]:
     common_rows = _load_common_rows(common_summary_path)
     artifacts = discover_artifacts(models_dir)
     rows: List[Dict[str, object]] = []
@@ -249,6 +343,7 @@ def build_rows(models_dir: Path, common_summary_path: Path) -> List[Dict[str, ob
         common_row = common_rows.get(spec.common_row_key) if spec.common_row_key else None
         common_score = _safe_float(common_row.get("overall_exact")) if common_row else None
         recipe_score = _safe_float(spec.recipe_eval_accuracy)
+        specialist_score, specialist_label = _load_specialist_metric(repo_root, spec)
         row = {
             "model_key": spec.key,
             "label": spec.label,
@@ -259,6 +354,8 @@ def build_rows(models_dir: Path, common_summary_path: Path) -> List[Dict[str, ob
             "common_benchmark_model": spec.common_row_key,
             "common_overall_exact": common_score,
             "recipe_eval_accuracy": recipe_score,
+            "specialist_metric_value": specialist_score,
+            "specialist_metric_label": specialist_label,
             "score_source": spec.score_source if common_score is None else ("common_alias" if spec.common_row_key and spec.common_row_key != spec.key else "common"),
             "note": spec.note,
         }
@@ -284,26 +381,33 @@ def write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
         "common_benchmark_model",
         "common_overall_exact",
         "recipe_eval_accuracy",
+        "specialist_metric_label",
+        "specialist_metric_value",
         "score_source",
         "note",
-    ]
+    ] + [f"benchmark_{name}" for name in BENCHMARK_ORDER]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            writer.writerow(
-                {
-                    "label": row["label"],
-                    "family": row["family"],
-                    "zip_name": row["zip_name"],
-                    "zip_size_bytes": row["zip_size_bytes"],
-                    "common_benchmark_model": row.get("common_benchmark_model") or "",
-                    "common_overall_exact": "" if row.get("common_overall_exact") is None else f"{float(row['common_overall_exact']):.6f}",
-                    "recipe_eval_accuracy": "" if row.get("recipe_eval_accuracy") is None else f"{float(row['recipe_eval_accuracy']):.6f}",
-                    "score_source": row["score_source"],
-                    "note": row["note"],
-                }
-            )
+            csv_row = {
+                "label": row["label"],
+                "family": row["family"],
+                "zip_name": row["zip_name"],
+                "zip_size_bytes": row["zip_size_bytes"],
+                "common_benchmark_model": row.get("common_benchmark_model") or "",
+                "common_overall_exact": "" if row.get("common_overall_exact") is None else f"{float(row['common_overall_exact']):.6f}",
+                "recipe_eval_accuracy": "" if row.get("recipe_eval_accuracy") is None else f"{float(row['recipe_eval_accuracy']):.6f}",
+                "specialist_metric_label": row.get("specialist_metric_label") or "",
+                "specialist_metric_value": "" if row.get("specialist_metric_value") is None else f"{float(row['specialist_metric_value']):.6f}",
+                "score_source": row["score_source"],
+                "note": row["note"],
+            }
+            per_benchmark = row.get("per_benchmark") if isinstance(row.get("per_benchmark"), dict) else {}
+            for name in BENCHMARK_ORDER:
+                value = _safe_float(per_benchmark.get(name) if isinstance(per_benchmark, dict) else None)
+                csv_row[f"benchmark_{name}"] = "" if value is None else f"{value:.6f}"
+            writer.writerow(csv_row)
 
 
 def _svg_escape(text: str) -> str:
@@ -595,6 +699,93 @@ def render_pdf(path: Path, rows: Sequence[Dict[str, object]], models_dir: Path, 
     )
 
     c.showPage()
+
+    # Per-benchmark heatmap page for all local packaged models.
+    page_width, page_height = landscape(letter)
+    c.setPageSize((page_width, page_height))
+    c.setTitle("Local Model Benchmark Matrix")
+    c.setFillColor(colors.HexColor("#111827"))
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(36, page_height - 28, "Local Model Benchmark Matrix")
+    draw_wrapped(
+        "Rows cover every unique model represented by the local zip set. Common benchmark cells show saved exact-match scores; specialist-only models are marked N/A and carry their local specialist metric in the last column.",
+        36,
+        page_height - 46,
+        page_width - 72,
+        "Helvetica",
+        9,
+        colors.HexColor("#374151"),
+    )
+
+    table_left = 26
+    table_top = page_height - 90
+    row_h = 22
+    model_col_w = 168
+    family_col_w = 54
+    metric_col_w = 56
+    score_col_w = 50
+    headers = ["Model", "Fam", "Overall"] + [BENCHMARK_LABELS[name] for name in BENCHMARK_ORDER] + ["Spec"]
+    col_widths = [model_col_w, family_col_w, score_col_w] + [score_col_w] * len(BENCHMARK_ORDER) + [metric_col_w]
+    total_width = sum(col_widths)
+
+    def draw_cell(x: float, y: float, w: float, h: float, text: str, fill_color, text_color=colors.black, align: str = "center", font_size: int = 7, font_name: str = "Helvetica") -> None:
+        c.setFillColor(fill_color)
+        c.rect(x, y, w, h, stroke=1, fill=1)
+        c.setFillColor(text_color)
+        c.setFont(font_name, font_size)
+        if align == "left":
+            c.drawString(x + 3, y + h / 2 - 2, text)
+        elif align == "right":
+            c.drawRightString(x + w - 3, y + h / 2 - 2, text)
+        else:
+            c.drawCentredString(x + w / 2, y + h / 2 - 2, text)
+
+    x = table_left
+    y = table_top
+    for header, width in zip(headers, col_widths):
+        draw_cell(x, y, width, row_h, header, colors.HexColor("#e5e7eb"), colors.HexColor("#111827"), font_size=8, font_name="Helvetica-Bold")
+        x += width
+
+    def heat_fill(value: Optional[float]):
+        if value is None:
+            return colors.HexColor("#f3f4f6")
+        clamped = max(0.0, min(1.0, value))
+        red = int(246 - (clamped * 110))
+        green = int(244 - (clamped * 20))
+        blue = int(250 - (clamped * 170))
+        return colors.Color(red / 255.0, green / 255.0, blue / 255.0)
+
+    for idx, row in enumerate(rows):
+        y = table_top - (idx + 1) * row_h
+        x = table_left
+        fill = colors.HexColor("#ffffff" if idx % 2 == 0 else "#fafafa")
+        draw_cell(x, y, model_col_w, row_h, str(row["label"]), fill, colors.HexColor("#111827"), align="left")
+        x += model_col_w
+        draw_cell(x, y, family_col_w, row_h, str(row["family"])[:8], colors.HexColor(FAMILY_COLORS.get(str(row["family"]), "#9ca3af")), colors.white, font_size=6)
+        x += family_col_w
+
+        overall = _safe_float(row.get("common_overall_exact"))
+        draw_cell(x, y, score_col_w, row_h, "N/A" if overall is None else f"{overall:.2f}", heat_fill(overall), colors.HexColor("#111827"))
+        x += score_col_w
+
+        per_benchmark = row.get("per_benchmark") if isinstance(row.get("per_benchmark"), dict) else {}
+        for benchmark_name in BENCHMARK_ORDER:
+            value = _safe_float(per_benchmark.get(benchmark_name) if isinstance(per_benchmark, dict) else None)
+            draw_cell(x, y, score_col_w, row_h, "N/A" if value is None else f"{value:.2f}", heat_fill(value), colors.HexColor("#111827"))
+            x += score_col_w
+
+        specialist_metric = _safe_float(row.get("specialist_metric_value"))
+        specialist_text = "N/A"
+        if specialist_metric is not None:
+            specialist_text = f"{specialist_metric:.2f}"
+        elif _safe_float(row.get("recipe_eval_accuracy")) is not None:
+            specialist_text = f"r {float(row['recipe_eval_accuracy']):.2f}"
+        draw_cell(x, y, metric_col_w, row_h, specialist_text, heat_fill(specialist_metric), colors.HexColor("#111827"))
+
+    c.setFillColor(colors.HexColor("#4b5563"))
+    c.setFont("Helvetica", 8)
+    c.drawString(36, 34, f"Generated {generated_at.strftime('%Y-%m-%d %H:%M UTC')} from saved benchmark outputs plus specialist summaries where common scores do not exist.")
+    c.drawString(36, 20, "Spec column: local specialist metric when available, otherwise recipe holdout marker prefixed with 'r'.")
     c.save()
 
 
@@ -610,7 +801,8 @@ def main() -> int:
     output_prefix = Path(args.output_prefix).resolve()
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = build_rows(models_dir=models_dir, common_summary_path=common_summary)
+    repo_root = Path(__file__).resolve().parent.parent
+    rows = build_rows(models_dir=models_dir, common_summary_path=common_summary, repo_root=repo_root)
     if not rows:
         raise RuntimeError(f"No matching model zips found in {models_dir}")
 
@@ -634,6 +826,7 @@ def main() -> int:
             "Scores in common_overall_exact come from the existing expanded common-benchmark sweep in the repo output directory.",
             "Rows marked common_alias map a final artifact to the chosen or equivalent scored checkpoint.",
             "v39_final only has recipe_eval_accuracy because its common-benchmark run never completed after the pod lost credit.",
+            "Specialist-only models expose their own validation metric in specialist_metric_value and render as N/A in the common benchmark matrix.",
         ],
     }
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

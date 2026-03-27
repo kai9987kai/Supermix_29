@@ -21,6 +21,11 @@ IMAGE_PROMPT_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+VISION_PROMPT_RE = re.compile(
+    r"\b(upload|uploaded|analyze image|analyse image|recognize|recognise|identify|what is in this image|"
+    r"what does this image show|look at the image|describe the image|visual clue|photo analysis)\b",
+    re.IGNORECASE,
+)
 FAST_PROMPT_RE = re.compile(r"\b(fast|quick|brief|short|lite|tiny|minimal)\b", re.IGNORECASE)
 CODE_PROMPT_RE = re.compile(
     r"\b(code|python|javascript|typescript|bug|debug|traceback|stack trace|sql|api|regex|function)\b",
@@ -93,6 +98,10 @@ class ModelRecord:
     def supports_image(self) -> bool:
         return "image" in self.capabilities
 
+    @property
+    def supports_vision(self) -> bool:
+        return "vision" in self.capabilities
+
     def to_dict(self) -> Dict[str, object]:
         return {
             "key": self.key,
@@ -114,6 +123,32 @@ class ModelRecord:
 
 
 MODEL_SPECS: Tuple[ModelSpec, ...] = (
+    ModelSpec(
+        key="science_vision_micro_v1",
+        label="Science Vision Micro",
+        family="vision",
+        kind="image_recognition",
+        filename_tokens=("supermix_science_image_recognition_micro_v1_",),
+        common_row_key=None,
+        capabilities=("chat", "vision"),
+        note="Small local image-recognition specialist trained on the bundled science diagram set.",
+        benchmark_hint="Upload-image recognition specialist.",
+        preferred_weights=("science_image_recognition_micro_v1.pth",),
+        preferred_meta=("science_image_recognition_micro_v1_meta.json",),
+    ),
+    ModelSpec(
+        key="omni_collective_v1",
+        label="Omni Collective V1",
+        family="fusion",
+        kind="omni_collective",
+        filename_tokens=("supermix_omni_collective_v1_",),
+        common_row_key=None,
+        capabilities=("chat", "vision"),
+        note="Fused local checkpoint trained from the model catalog plus the math and science-image corpora.",
+        benchmark_hint="Multimodal fused assistant.",
+        preferred_weights=("omni_collective_v1.pth",),
+        preferred_meta=("omni_collective_v1_meta.json",),
+    ),
     ModelSpec(
         key="math_equation_micro_v1",
         label="Math Equation Micro",
@@ -424,19 +459,40 @@ def discover_model_records(
     return records
 
 
-def choose_auto_model(records: Sequence[ModelRecord], prompt: str, action_mode: str = "auto") -> Tuple[Optional[ModelRecord], str]:
+def choose_auto_model(
+    records: Sequence[ModelRecord],
+    prompt: str,
+    action_mode: str = "auto",
+    uploaded_image_path: str = "",
+) -> Tuple[Optional[ModelRecord], str]:
     available = {record.key: record for record in records}
     text_models = [record for record in records if record.supports_chat]
     image_models = [record for record in records if record.supports_image]
+    vision_models = [record for record in records if record.supports_vision]
     prompt_text = str(prompt or "").strip()
     lowered = prompt_text.lower()
+    has_uploaded_image = bool(str(uploaded_image_path or "").strip())
 
     if not prompt_text:
         return (available.get("v33_final") or (text_models[0] if text_models else None), "Empty prompt fell back to the default text model.")
 
     wants_image = action_mode == "image" or (action_mode == "auto" and bool(IMAGE_PROMPT_RE.search(prompt_text)))
+    wants_vision = (
+        action_mode == "vision"
+        or has_uploaded_image
+        or (action_mode == "auto" and bool(VISION_PROMPT_RE.search(prompt_text)))
+    )
     wants_fast = bool(FAST_PROMPT_RE.search(prompt_text)) or len(prompt_text) < 34
     wants_math = action_mode != "image" and bool(MATH_PROMPT_RE.search(prompt_text))
+
+    if wants_vision and vision_models:
+        if has_uploaded_image and any(token in lowered for token in ("compare", "explain", "teach", "why", "analyze", "analyse")):
+            for key in ("omni_collective_v1", "science_vision_micro_v1"):
+                if key in available:
+                    return available[key], "Auto picked a vision-capable chat model because an uploaded image needs analysis."
+        for key in ("science_vision_micro_v1", "omni_collective_v1"):
+            if key in available:
+                return available[key], "Auto picked the uploaded-image recognition model because the prompt looks visual."
 
     if wants_image and image_models:
         if wants_fast:
@@ -465,6 +521,11 @@ def choose_auto_model(records: Sequence[ModelRecord], prompt: str, action_mode: 
             if key in available:
                 return available[key], "Auto picked the strongest benchmarked reasoning/coding text model."
 
+    if any(token in lowered for token in ("which model", "best model", "select a model", "pick a model")):
+        for key in ("omni_collective_v1", "v33_final", "qwen_v28"):
+            if key in available:
+                return available[key], "Auto picked the fused catalog model because the prompt asks about model choice."
+
     if CREATIVE_PROMPT_RE.search(prompt_text):
         for key in ("qwen_v28", "v33_final", "v31_final"):
             if key in available:
@@ -485,7 +546,7 @@ def models_to_json(records: Iterable[ModelRecord]) -> List[Dict[str, object]]:
             "label": "Auto",
             "family": "router",
             "kind": "auto",
-            "capabilities": ["chat", "image"],
+            "capabilities": ["chat", "image", "vision"],
             "zip_path": "",
             "zip_name": "",
             "zip_size_bytes": 0,

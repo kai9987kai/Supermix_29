@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import io
 import json
+import re
 import threading
 import time
 import zipfile
@@ -11,9 +13,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+from PIL import Image
 
 import chat_web_app
-import qwen_chat_web_app
 from chat_export import copy_generated_image, render_chat_transcript_image
 from chat_image_variant_app import (
     DEFAULT_IMAGE_MODEL,
@@ -24,17 +26,21 @@ from device_utils import configure_torch_runtime, resolve_device
 from multimodel_catalog import ModelRecord, choose_auto_model
 from multimodel_memory import ConversationMemoryStore
 from multimodel_tools import (
+    CmdOpenTool,
     ToolEvent,
     WebSearchTool,
     format_tool_results,
-    parse_tool_calls,
+    parse_tool_requests,
     should_offer_web_search,
+    should_offer_open_cmd,
     strip_tool_calls,
 )
 from math_equation_model import MathEquationEngine, format_math_response
 from native_image_infer_v36 import ChampionNetFrontierCollectiveNativeImage, save_prompt_image as save_prompt_image_v36
 from native_image_infer_v37_lite import ChampionNetUltraExpertNativeImageLite, save_prompt_image as save_prompt_image_v37
 from native_image_infer_v38_xlite import ChampionNetUltraExpertNativeImageExtraLite, save_prompt_image as save_prompt_image_v38
+from image_recognition_model import ScienceImageRecognitionEngine, looks_like_vision_prompt
+from omni_collective_model import OmniCollectiveEngine
 from run import safe_load_state_dict
 
 
@@ -78,6 +84,11 @@ def _safe_slug(text: str) -> str:
 def _trim_text(text: str, limit: int = 320) -> str:
     cooked = " ".join(str(text or "").strip().split())
     return cooked[:limit]
+
+
+def _safe_upload_name(filename: str) -> str:
+    cooked = re.sub(r"[^A-Za-z0-9._-]+", "-", str(filename or "").strip()).strip(".-")
+    return cooked[:96] or "upload.png"
 
 
 def _extract_zip_once(zip_path: Path, extraction_root: Path) -> Path:
@@ -319,10 +330,13 @@ class ImageWrapperBackend(ChampionChatBackend):
 class QwenBackend(BaseBackend):
     def __init__(self, record: ModelRecord, extracted_dir: Path, generated_dir: Path) -> None:
         super().__init__(record, extracted_dir, generated_dir)
+        import qwen_chat_web_app  # lazy import so source runtime can start without the Qwen stack installed
+
+        self._qwen = qwen_chat_web_app
         self.adapter_dir = _find_adapter_dir(extracted_dir, record.adapter_markers)
-        self.device = qwen_chat_web_app.resolve_device("auto")
-        self.base_model = qwen_chat_web_app.resolve_base_model_path("", self.adapter_dir)
-        self.engine = qwen_chat_web_app.load_engine(
+        self.device = self._qwen.resolve_device("auto")
+        self.base_model = self._qwen.resolve_base_model_path("", self.adapter_dir)
+        self.engine = self._qwen.load_engine(
             base_model=self.base_model,
             adapter_dir=self.adapter_dir,
             device=self.device,
@@ -481,6 +495,77 @@ class MathEquationBackend(BaseBackend):
         )
 
 
+class ImageRecognitionBackend(BaseBackend):
+    def __init__(self, record: ModelRecord, extracted_dir: Path, generated_dir: Path) -> None:
+        super().__init__(record, extracted_dir, generated_dir)
+        weights_path = _find_matching_file(extracted_dir, record.preferred_weights, ".pth")
+        meta_path = _find_matching_file(extracted_dir, record.preferred_meta, ".json")
+        if weights_path is None or meta_path is None:
+            raise FileNotFoundError(f"Missing image-recognition weights/meta for {record.label} in {extracted_dir}")
+        self.weights_path = weights_path.resolve()
+        self.meta_path = meta_path.resolve()
+        self.engine = ScienceImageRecognitionEngine(weights_path=self.weights_path, meta_path=self.meta_path)
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "backend": "image_recognition",
+            "record": self.record.to_dict(),
+            "weights_path": str(self.weights_path),
+            "meta_path": str(self.meta_path),
+            "runtime": self.engine.status(),
+        }
+
+    def chat(self, session_id: str, prompt: str, settings: Dict[str, Any]) -> ChatResult:
+        image_path = str(settings.get("uploaded_image_path") or "").strip()
+        if not image_path:
+            response = "Upload an image first, then I can identify the science concept and explain the visual clues."
+        else:
+            response = self.engine.answer(prompt, image_path=image_path)
+        return ChatResult(
+            kind="text",
+            model_key=self.record.key,
+            model_label=self.record.label,
+            route_reason=str(settings.get("route_reason") or ""),
+            response=response,
+            timing={},
+            prompt_used=str(prompt),
+        )
+
+
+class OmniCollectiveBackend(BaseBackend):
+    def __init__(self, record: ModelRecord, extracted_dir: Path, generated_dir: Path) -> None:
+        super().__init__(record, extracted_dir, generated_dir)
+        weights_path = _find_matching_file(extracted_dir, record.preferred_weights, ".pth")
+        meta_path = _find_matching_file(extracted_dir, record.preferred_meta, ".json")
+        if weights_path is None or meta_path is None:
+            raise FileNotFoundError(f"Missing omnibus weights/meta for {record.label} in {extracted_dir}")
+        self.weights_path = weights_path.resolve()
+        self.meta_path = meta_path.resolve()
+        self.engine = OmniCollectiveEngine(weights_path=self.weights_path, meta_path=self.meta_path)
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "backend": "omni_collective",
+            "record": self.record.to_dict(),
+            "weights_path": str(self.weights_path),
+            "meta_path": str(self.meta_path),
+            "runtime": self.engine.status(),
+        }
+
+    def chat(self, session_id: str, prompt: str, settings: Dict[str, Any]) -> ChatResult:
+        image_path = str(settings.get("uploaded_image_path") or "").strip()
+        response = self.engine.answer(prompt, image_path=image_path or None)
+        return ChatResult(
+            kind="text",
+            model_key=self.record.key,
+            model_label=self.record.label,
+            route_reason=str(settings.get("route_reason") or ""),
+            response=response,
+            timing={},
+            prompt_used=str(prompt),
+        )
+
+
 class UnifiedModelManager:
     def __init__(
         self,
@@ -500,6 +585,8 @@ class UnifiedModelManager:
         self.record_map = {record.key: record for record in self.records}
         self.extraction_root = extraction_root.resolve()
         self.generated_dir = generated_dir.resolve()
+        self.uploads_dir = self.extraction_root.parent / "uploads"
+        self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.exports_dir = self.extraction_root.parent / "exports"
         self.exports_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
@@ -511,6 +598,7 @@ class UnifiedModelManager:
         self._lock = threading.RLock()
         self.memory_store = ConversationMemoryStore(self.extraction_root.parent / "memory")
         self.web_search = WebSearchTool()
+        self.cmd_open = CmdOpenTool()
 
     def _build_backend(self, record: ModelRecord) -> BaseBackend:
         extracted_dir = _extract_zip_once(record.zip_path, self.extraction_root)
@@ -522,6 +610,10 @@ class UnifiedModelManager:
             return NativeImageBackend(record, extracted_dir, self.generated_dir, self.device)
         if record.kind == "math_equation":
             return MathEquationBackend(record, extracted_dir, self.generated_dir)
+        if record.kind == "image_recognition":
+            return ImageRecognitionBackend(record, extracted_dir, self.generated_dir)
+        if record.kind == "omni_collective":
+            return OmniCollectiveBackend(record, extracted_dir, self.generated_dir)
         if record.kind == "qwen_adapter":
             return QwenBackend(record, extracted_dir, self.generated_dir)
         raise RuntimeError(f"Unsupported model kind: {record.kind}")
@@ -558,14 +650,18 @@ class UnifiedModelManager:
         return self.memory_store.build_context(session_id, prompt)
 
     def _seed_auto_tool_events(self, prompt: str, settings: Dict[str, Any]) -> List[ToolEvent]:
-        if not bool(settings.get("web_search_enabled", False)):
-            return []
-        if not should_offer_web_search(prompt):
-            return []
-        try:
-            return [self.web_search.search(prompt, max_results=int(settings.get("web_search_results") or 5))]
-        except Exception:
-            return []
+        events: List[ToolEvent] = []
+        if bool(settings.get("web_search_enabled", False)) and should_offer_web_search(prompt):
+            try:
+                events.append(self.web_search.search(prompt, max_results=int(settings.get("web_search_results") or 5)))
+            except Exception:
+                pass
+        if bool(settings.get("cmd_open_enabled", True)) and should_offer_open_cmd(prompt):
+            try:
+                events.append(self.cmd_open.open(""))
+            except Exception:
+                pass
+        return events
 
     def _run_web_query_cached(
         self,
@@ -582,6 +678,22 @@ class UnifiedModelManager:
             return None
         try:
             event = self.web_search.search(query, max_results=int(settings.get("web_search_results") or 5))
+        except Exception:
+            return None
+        tool_cache[key] = event
+        return event
+
+    def _run_cmd_open_cached(
+        self,
+        working_dir: str,
+        tool_cache: Dict[str, ToolEvent],
+    ) -> Optional[ToolEvent]:
+        cooked_dir = _trim_text(working_dir or "", limit=220)
+        key = f"open_cmd::{cooked_dir.lower()}"
+        if key in tool_cache:
+            return tool_cache[key]
+        try:
+            event = self.cmd_open.open(cooked_dir)
         except Exception:
             return None
         tool_cache[key] = event
@@ -604,25 +716,34 @@ class UnifiedModelManager:
         run_settings["route_reason"] = route_reason
         if tool_cache:
             run_settings["tool_context"] = format_tool_results(list(tool_cache.values()))
-        if allow_tool_calls and bool(settings.get("web_search_enabled", False)):
+        if allow_tool_calls and (bool(settings.get("web_search_enabled", False)) or bool(settings.get("cmd_open_enabled", True))):
             run_settings["tool_instruction"] = (
-                "If current or external web information is required, start with exactly "
-                "TOOL:web_search: <query> on its own line. Otherwise answer normally."
+                "Available tools:\n"
+                "TOOL:web_search: <query>\n"
+                "TOOL:open_cmd: <optional working directory>\n"
+                "Use a tool line only when it is explicitly needed, otherwise answer normally."
             )
         result = backend.chat(session_id, prompt, run_settings)
         raw_response = str(result.response or "")
-        queries = parse_tool_calls(raw_response) if allow_tool_calls else []
+        requests = parse_tool_requests(raw_response) if allow_tool_calls else []
         result.response = strip_tool_calls(raw_response)
-        if queries:
-            tool_event = self._run_web_query_cached(queries[0], tool_cache, settings)
-            if tool_event is not None:
-                local_events.append(tool_event)
+        if requests:
+            for request in requests:
+                if request["name"] == "web_search" and bool(settings.get("web_search_enabled", False)):
+                    tool_event = self._run_web_query_cached(request["argument"], tool_cache, settings)
+                elif request["name"] == "open_cmd" and bool(settings.get("cmd_open_enabled", True)):
+                    tool_event = self._run_cmd_open_cached(request["argument"], tool_cache)
+                else:
+                    tool_event = None
+                if tool_event is not None:
+                    local_events.append(tool_event)
+            if local_events:
                 follow_settings = dict(settings)
                 follow_settings["route_reason"] = route_reason
                 follow_settings["memory_context"] = str(settings.get("memory_context") or "")
                 follow_settings["consultation_context"] = str(settings.get("consultation_context") or "")
                 follow_settings["tool_context"] = format_tool_results(list(tool_cache.values()))
-                follow_settings["tool_instruction"] = "Web results are already available below. Use them and answer directly."
+                follow_settings["tool_instruction"] = "Tool results are already available below. Use them and answer directly."
                 follow = backend.chat(session_id, prompt, follow_settings)
                 follow.response = strip_tool_calls(follow.response)
                 result = follow
@@ -809,6 +930,7 @@ class UnifiedModelManager:
                 "models_available": len(self.records),
                 "device": self.device_info.get("resolved", str(self.device)),
                 "generated_dir": str(self.generated_dir),
+                "uploads_dir": str(self.uploads_dir),
                 "exports_dir": str(self.exports_dir),
                 "extraction_root": str(self.extraction_root),
                 "memory_status": self.memory_store.global_status(),
@@ -835,6 +957,35 @@ class UnifiedModelManager:
                 self._backend.clear(session_id)
                 self._backend.clear(self._session_scope(session_id, self._backend_key, "consult"))
                 self._backend.clear(self._session_scope(session_id, self._backend_key, "answer"))
+            session_upload_dir = self.uploads_dir / _safe_slug(session_id)
+            if session_upload_dir.exists():
+                for child in sorted(session_upload_dir.rglob("*"), reverse=True):
+                    if child.is_file():
+                        child.unlink(missing_ok=True)
+                    else:
+                        try:
+                            child.rmdir()
+                        except OSError:
+                            pass
+                try:
+                    session_upload_dir.rmdir()
+                except OSError:
+                    pass
+
+    def store_uploaded_image(self, *, session_id: str, filename: str, raw_bytes: bytes) -> Dict[str, Any]:
+        with self._lock:
+            image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+            session_dir = self.uploads_dir / _safe_slug(session_id)
+            session_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = _safe_upload_name(filename)
+            target = session_dir / f"{Path(safe_name).stem}.png"
+            image.save(target, format="PNG")
+            return {
+                "ok": True,
+                "saved_path": str(target),
+                "image_url": f"/uploads/{_safe_slug(session_id)}/{target.name}",
+                "filename": target.name,
+            }
 
     def save_generated_image(self, *, source_path: str, destination_hint: str = "") -> Dict[str, Any]:
         with self._lock:
@@ -877,7 +1028,12 @@ class UnifiedModelManager:
         with self._lock:
             requested_key = model_key or self.selected_model_key or "auto"
             if requested_key == "auto":
-                chosen_record, route_reason = choose_auto_model(self.records, prompt, action_mode=action_mode)
+                chosen_record, route_reason = choose_auto_model(
+                    self.records,
+                    prompt,
+                    action_mode=action_mode,
+                    uploaded_image_path=str((settings or {}).get("uploaded_image_path") or ""),
+                )
                 if chosen_record is None:
                     raise RuntimeError("No local models were discovered.")
             else:
@@ -897,6 +1053,7 @@ class UnifiedModelManager:
             settings.setdefault("memory_enabled", True)
             settings.setdefault("agent_mode", "off")
             settings.setdefault("web_search_enabled", False)
+            settings.setdefault("cmd_open_enabled", True)
             settings.setdefault("web_search_budget", 3)
             settings.setdefault("web_search_results", 5)
             memory_bundle = self._prepare_memory_bundle(session_id, prompt, settings)

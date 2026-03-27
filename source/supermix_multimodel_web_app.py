@@ -91,6 +91,11 @@ HTML = """<!doctype html>
     .image-card{display:grid;gap:12px}
     .image-card img{display:block;max-width:min(520px,100%);width:100%;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:#050b13}
     .image-caption{color:#d1e1f5;font-size:13px;line-height:1.58}
+    .upload-box{display:grid;gap:10px;padding:12px;border-radius:16px;border:1px solid rgba(255,255,255,.06);background:rgba(4,10,16,.72)}
+    .upload-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+    .upload-preview{display:none;gap:10px;align-items:flex-start}
+    .upload-preview img{display:block;max-width:140px;width:140px;border-radius:14px;border:1px solid rgba(255,255,255,.08);background:#050b13}
+    .upload-meta{display:grid;gap:6px;font-size:12px;color:#c6d7ec;line-height:1.5}
     .msg-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
     .mini-btn{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--text);cursor:pointer;font:inherit}
     .trace-box{margin-top:12px;padding:12px 13px;border-radius:14px;border:1px solid rgba(255,255,255,.06);background:rgba(6,12,20,.72);color:#c6d7ec;font-size:12px;line-height:1.55;white-space:pre-wrap}
@@ -132,6 +137,7 @@ HTML = """<!doctype html>
           <select id="actionMode">
             <option value="auto">Auto</option>
             <option value="text">Text</option>
+            <option value="vision">Vision</option>
             <option value="image">Image</option>
           </select>
         </div>
@@ -241,7 +247,7 @@ HTML = """<!doctype html>
       <section class="thread" id="thread">
         <div class="welcome" id="welcomeCard">
           Use <strong>Auto</strong> for per-prompt routing, or pin a single model from the dropdown.
-          Image-capable models can return generated images directly in this thread.
+          Image-capable models can return generated images directly in this thread, and vision-capable models can analyze an uploaded image in the same chat.
         </div>
       </section>
 
@@ -251,6 +257,15 @@ HTML = """<!doctype html>
             <input id="imageWidth" type="number" min="64" max="1024" step="64" value="512" placeholder="Width">
             <input id="imageHeight" type="number" min="64" max="1024" step="64" value="512" placeholder="Height">
             <input id="imageSteps" type="number" min="1" max="4" step="1" value="2" placeholder="Steps">
+          </div>
+          <div class="upload-box" id="uploadBox" style="display:none">
+            <div class="upload-row">
+              <input id="imageUpload" type="file" accept="image/*">
+              <button class="ghost" id="uploadBtn">Upload Image</button>
+              <button class="ghost" id="clearUploadBtn">Clear Upload</button>
+            </div>
+            <div class="note" id="uploadStatus">Select a vision-capable model or Auto to attach an image.</div>
+            <div class="upload-preview" id="uploadPreview"></div>
           </div>
           <textarea id="prompt" placeholder="Type a message, coding question, reasoning task, or image prompt. Press Enter to send, Shift+Enter for a new line."></textarea>
           <div class="chip-row" id="starterChips"></div>
@@ -287,6 +302,9 @@ HTML = """<!doctype html>
     let selectedModelKey = 'auto';
     let transcript = [];
     let lastGeneratedImagePath = '';
+    let currentUploadedImagePath = '';
+    let currentUploadedImageUrl = '';
+    let currentUploadedImageName = '';
 
     function escapeHtml(value){
       return String(value || '')
@@ -337,12 +355,12 @@ HTML = """<!doctype html>
       const role = kind === 'user' ? 'user' : 'assistant';
       return {
         role,
-        kind: payload.kind || 'text',
+        kind: payload.kind || (payload.uploaded_image_url ? 'image' : 'text'),
         model_label: payload.model_label || (role === 'user' ? 'You' : 'Assistant'),
         response: payload.response || '',
-        prompt_used: payload.prompt_used || '',
-        output_path: payload.output_path || '',
-        image_url: payload.image_url || '',
+        prompt_used: payload.prompt_used || payload.response || '',
+        output_path: payload.output_path || payload.uploaded_image_path || '',
+        image_url: payload.image_url || payload.uploaded_image_url || '',
         route_reason: payload.route_reason || ''
       };
     }
@@ -363,9 +381,47 @@ HTML = """<!doctype html>
       (record?.capabilities || []).forEach(cap => {
         const chip = document.createElement('div');
         chip.className = 'cap ' + cap;
-        chip.textContent = cap === 'image' ? 'Image' : 'Chat';
+        chip.textContent = cap === 'image' ? 'Image' : (cap === 'vision' ? 'Vision' : 'Chat');
         box.appendChild(chip);
       });
+    }
+
+    function shouldShowUpload(record){
+      if(!record) return false;
+      if(record.key === 'auto') return true;
+      if((record.capabilities || []).includes('vision')) return true;
+      return el('agentMode').value === 'collective';
+    }
+
+    function renderUploadPreview(){
+      const box = el('uploadPreview');
+      if(!currentUploadedImageUrl){
+        box.style.display = 'none';
+        box.innerHTML = '';
+        return;
+      }
+      box.style.display = 'grid';
+      box.innerHTML = `
+        <img src="${escapeHtml(currentUploadedImageUrl)}" alt="uploaded image">
+        <div class="upload-meta">
+          <strong>${escapeHtml(currentUploadedImageName || 'uploaded image')}</strong>
+          <div>${escapeHtml(currentUploadedImagePath)}</div>
+        </div>
+      `;
+    }
+
+    function refreshUploadPanel(){
+      const record = findRecord(el('modelSelect').value) || findRecord(selectedModelKey) || findRecord('auto');
+      const visible = shouldShowUpload(record);
+      el('uploadBox').style.display = visible ? 'grid' : 'none';
+      if(!visible){
+        el('uploadStatus').textContent = 'Select a vision-capable model or Auto to attach an image.';
+      } else if(currentUploadedImagePath){
+        el('uploadStatus').textContent = 'Uploaded image is attached to the next prompt.';
+      } else {
+        el('uploadStatus').textContent = 'Upload an image if you want the vision models to analyze it.';
+      }
+      renderUploadPreview();
     }
 
     function updateModelPanel(record){
@@ -394,6 +450,7 @@ HTML = """<!doctype html>
       select.value = selectedModelKey;
       el('catalogCount').textContent = String(Math.max(0, catalog.length - 1));
       updateModelPanel(findRecord(selectedModelKey) || findRecord('auto'));
+      refreshUploadPanel();
     }
 
     function addMessage(kind, payload){
@@ -429,6 +486,15 @@ HTML = """<!doctype html>
         body.className = 'body';
         body.textContent = payload.response || '';
         card.appendChild(body);
+        if(payload.uploaded_image_url){
+          const preview = document.createElement('div');
+          preview.className = 'image-card';
+          preview.innerHTML = `
+            <img src="${escapeHtml(payload.uploaded_image_url || '')}" alt="uploaded image">
+            <div class="image-caption">${escapeHtml(payload.uploaded_image_name || 'Attached image')}</div>
+          `;
+          card.appendChild(preview);
+        }
       }
       if(payload.route_reason){
         const route = document.createElement('div');
@@ -446,10 +512,13 @@ HTML = """<!doctype html>
         }
         if((payload.agent_trace.tool_events || []).length){
           const searchBits = payload.agent_trace.tool_events.map(event => {
+            if(event.name === 'open_cmd'){
+              return `- open_cmd -> ${(event.results || [])[0]?.snippet || 'Command Prompt opened'}`;
+            }
             const domains = (event.results || []).slice(0, 3).map(item => item.domain || item.url || item.title).filter(Boolean).join(', ');
             return `- ${event.query}${domains ? ' -> ' + domains : ''}`;
           });
-          blocks.push('Web Search\\n' + searchBits.join('\\n'));
+          blocks.push('Tool Activity\\n' + searchBits.join('\\n'));
         }
         if(blocks.length){
           const trace = document.createElement('div');
@@ -509,6 +578,7 @@ HTML = """<!doctype html>
         thread.innerHTML = '';
         transcript = [];
         lastGeneratedImagePath = '';
+        clearUploadedImage();
         const welcome = document.createElement('div');
         welcome.className = 'welcome';
         welcome.textContent = 'Session cleared.';
@@ -564,9 +634,11 @@ HTML = """<!doctype html>
     }
 
     async function sendPrompt(){
-      const prompt = el('prompt').value.trim();
+      let prompt = el('prompt').value.trim();
+      if(!prompt && currentUploadedImagePath){
+        prompt = 'What is in this image?';
+      }
       if(!prompt) return;
-      addMessage('user', {response: prompt, kind: 'text'});
       el('prompt').value = '';
       const payload = {
         session_id: sessionId,
@@ -577,6 +649,7 @@ HTML = """<!doctype html>
           agent_mode: el('agentMode').value,
           memory_enabled: el('memoryMode').value === 'on',
           web_search_enabled: el('webSearchMode').value === 'on',
+          uploaded_image_path: currentUploadedImagePath,
           style_mode: el('styleMode').value,
           system_hint: el('systemHint').value,
           image_style: el('imageStyle').value,
@@ -585,6 +658,13 @@ HTML = """<!doctype html>
           image_steps: Number(el('imageSteps').value || 2)
         }
       };
+      addMessage('user', {
+        response: prompt,
+        kind: 'text',
+        uploaded_image_url: currentUploadedImageUrl,
+        uploaded_image_path: currentUploadedImagePath,
+        uploaded_image_name: currentUploadedImageName
+      });
       el('sendBtn').disabled = true;
       el('sendBtn').textContent = 'Working...';
       try{
@@ -598,6 +678,40 @@ HTML = """<!doctype html>
         el('sendBtn').disabled = false;
         el('sendBtn').textContent = 'Send';
       }
+    }
+
+    async function uploadImage(){
+      const file = el('imageUpload').files?.[0];
+      if(!file){
+        showToast('err', 'Choose an image file first.');
+        return;
+      }
+      const form = new FormData();
+      form.append('session_id', sessionId);
+      form.append('file', file);
+      try{
+        const response = await fetch('/api/upload_image', {method: 'POST', body: form});
+        const data = await response.json();
+        if(!response.ok || data.ok === false){
+          throw new Error(data.error || `HTTP ${response.status}`);
+        }
+        currentUploadedImagePath = data.saved_path || '';
+        currentUploadedImageUrl = data.image_url || '';
+        currentUploadedImageName = data.filename || file.name;
+        el('uploadStatus').textContent = 'Uploaded image is attached to the next prompt.';
+        renderUploadPreview();
+        showToast('ok', 'Image uploaded.');
+      }catch(error){
+        showToast('err', error.message);
+      }
+    }
+
+    function clearUploadedImage(){
+      currentUploadedImagePath = '';
+      currentUploadedImageUrl = '';
+      currentUploadedImageName = '';
+      el('imageUpload').value = '';
+      refreshUploadPanel();
     }
 
     function buildStarterChips(){
@@ -618,8 +732,12 @@ HTML = """<!doctype html>
     el('refreshBtn').onclick = refresh;
     el('clearBtn').onclick = clearChat;
     el('sendBtn').onclick = sendPrompt;
+    el('uploadBtn').onclick = uploadImage;
+    el('clearUploadBtn').onclick = clearUploadedImage;
     el('saveChatImageBtn').onclick = exportChatImage;
     el('saveLastImageBtn').onclick = saveLastImage;
+    el('modelSelect').addEventListener('change', refreshUploadPanel);
+    el('agentMode').addEventListener('change', refreshUploadPanel);
     thread.addEventListener('click', (event) => {
       const button = event.target.closest('.save-image-btn');
       if(!button) return;
@@ -661,6 +779,24 @@ def build_app(manager: UnifiedModelManager) -> Flask:
         if not session_id:
             return jsonify({"ok": False, "error": "session_id is required"}), 400
         return jsonify({"ok": True, "memory": manager.session_memory_snapshot(session_id)})
+
+    @app.post("/api/upload_image")
+    def api_upload_image():
+        session_id = str(request.form.get("session_id") or "").strip()
+        if not session_id:
+            return jsonify({"ok": False, "error": "session_id is required"}), 400
+        upload = request.files.get("file")
+        if upload is None or not getattr(upload, "filename", ""):
+            return jsonify({"ok": False, "error": "file is required"}), 400
+        try:
+            result = manager.store_uploaded_image(
+                session_id=session_id,
+                filename=str(upload.filename),
+                raw_bytes=upload.read(),
+            )
+            return jsonify(result)
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
 
     @app.post("/api/select_model")
     def api_select_model():
@@ -731,6 +867,11 @@ def build_app(manager: UnifiedModelManager) -> Flask:
     @app.get("/generated/<path:model_key>/<path:filename>")
     def generated_file(model_key: str, filename: str):
         target_dir = manager.generated_dir / model_key
+        return send_from_directory(target_dir, filename)
+
+    @app.get("/uploads/<path:session_key>/<path:filename>")
+    def uploaded_file(session_key: str, filename: str):
+        target_dir = manager.uploads_dir / session_key
         return send_from_directory(target_dir, filename)
 
     return app

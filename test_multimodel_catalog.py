@@ -58,3 +58,20 @@ def test_auto_prefers_math_specialist_for_equation_prompt() -> None:
     assert chosen is not None
     assert chosen.key == "math_equation_micro_v1"
     assert "math" in reason.lower() or "equation" in reason.lower()
+
+
+def test_auto_prefers_uploaded_image_specialist() -> None:
+    records = [
+        _record("v33_final", "champion_chat", ("chat",), 0.18),
+        _record("science_vision_micro_v1", "image_recognition", ("chat", "vision"), None),
+        _record("omni_collective_v1", "omni_collective", ("chat", "vision"), None),
+    ]
+    chosen, reason = choose_auto_model(
+        records,
+        "What does this uploaded image show?",
+        action_mode="auto",
+        uploaded_image_path=r"C:\temp\sample.png",
+    )
+    assert chosen is not None
+    assert chosen.key == "science_vision_micro_v1"
+    assert "image" in reason.lower() or "visual" in reason.lower()

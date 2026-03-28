@@ -28,6 +28,7 @@ $BaseModelDir = $BaseModelDir.Trim()
 
 $ModelsStageDir = Join-Path $RepoRoot "build\studio_models_stage"
 $BaseModelStageDir = Join-Path $RepoRoot "build\studio_base_model_stage"
+$BundleManifestPath = Join-Path $RepoRoot "output\supermix_studio_bundled_models_manifest.json"
 
 if (Test-Path $ModelsStageDir) { Remove-Item -Recurse -Force $ModelsStageDir }
 if (Test-Path $BaseModelStageDir) { Remove-Item -Recurse -Force $BaseModelStageDir }
@@ -40,6 +41,18 @@ if (-not $ModelZipFiles) {
 foreach ($ZipFile in $ModelZipFiles) {
   Copy-Item -Force $ZipFile.FullName (Join-Path $ModelsStageDir $ZipFile.Name)
 }
+$BundleManifest = [ordered]@{
+  generated_at = (Get-Date).ToString("o")
+  models_dir = $ModelsDir
+  bundled_model_count = @($ModelZipFiles).Count
+  bundled_models = @($ModelZipFiles | Sort-Object Name | ForEach-Object {
+      [ordered]@{
+        name = $_.Name
+        size_bytes = $_.Length
+      }
+    })
+}
+$BundleManifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 $BundleManifestPath
 
 & $PythonExe "source\materialize_model_dir.py" $BaseModelDir $BaseModelStageDir | Out-Host
 
@@ -75,6 +88,7 @@ try {
     "--add-data", "$ModelsStageDir;bundled_models",
     "--add-data", "$BaseModelStageDir;bundled_base_model",
     "--add-data", "$SummaryPath;output",
+    "--add-data", "$BundleManifestPath;output",
     "source\supermix_multimodel_desktop_app.py"
   )
 

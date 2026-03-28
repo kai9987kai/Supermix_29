@@ -75,3 +75,15 @@ def test_auto_prefers_uploaded_image_specialist() -> None:
     assert chosen is not None
     assert chosen.key == "science_vision_micro_v1"
     assert "image" in reason.lower() or "visual" in reason.lower()
+
+
+def test_auto_prefers_newer_omni_collective_for_model_choice_prompt() -> None:
+    records = [
+        _record("v33_final", "champion_chat", ("chat",), 0.18),
+        _record("omni_collective_v1", "omni_collective", ("chat", "vision"), None),
+        _record("omni_collective_v2", "omni_collective", ("chat", "vision"), None),
+    ]
+    chosen, reason = choose_auto_model(records, "Which model should I use for this mixed coding and image-analysis task?")
+    assert chosen is not None
+    assert chosen.key == "omni_collective_v2"
+    assert "model" in reason.lower() or "fused" in reason.lower()

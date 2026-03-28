@@ -1,5 +1,7 @@
 param(
-  [string]$InstallerScript = "installer\SupermixStudioDesktop.iss"
+  [string]$InstallerScript = "installer\SupermixStudioDesktop.iss",
+  [string]$Version = "",
+  [string]$SetupBaseName = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,7 +20,16 @@ if (-not $IsccPath) {
   throw "Inno Setup compiler not found. Install Inno Setup 6, then rerun this script."
 }
 
-& $IsccPath $InstallerScript
+$IsccArgs = @()
+if ($Version) {
+  $IsccArgs += "/DMyAppVersion=$Version"
+}
+if ($SetupBaseName) {
+  $IsccArgs += "/DMySetupBaseName=$SetupBaseName"
+}
+$IsccArgs += $InstallerScript
+
+& $IsccPath @IsccArgs
 if ($LASTEXITCODE -ne 0) {
   throw "Inno Setup build failed."
 }

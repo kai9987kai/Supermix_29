@@ -150,6 +150,19 @@ MODEL_SPECS: Tuple[ModelSpec, ...] = (
         preferred_meta=("omni_collective_v1_meta.json",),
     ),
     ModelSpec(
+        key="omni_collective_v2",
+        label="Omni Collective V2 Frontier",
+        family="fusion",
+        kind="omni_collective",
+        filename_tokens=("supermix_omni_collective_v2_frontier_",),
+        common_row_key=None,
+        capabilities=("chat", "vision"),
+        note="Warm-started larger omni continuation trained on wider coding, knowledge, language, image-prompt, science-image, and 3D/video data.",
+        benchmark_hint="Expanded multimodal fused assistant.",
+        preferred_weights=("omni_collective_v2_frontier.pth",),
+        preferred_meta=("omni_collective_v2_frontier_meta.json",),
+    ),
+    ModelSpec(
         key="math_equation_micro_v1",
         label="Math Equation Micro",
         family="math",
@@ -484,13 +497,19 @@ def choose_auto_model(
     )
     wants_fast = bool(FAST_PROMPT_RE.search(prompt_text)) or len(prompt_text) < 34
     wants_math = action_mode != "image" and bool(MATH_PROMPT_RE.search(prompt_text))
+    wants_model_selection = any(token in lowered for token in ("which model", "best model", "select a model", "pick a model"))
+
+    if wants_model_selection:
+        for key in ("omni_collective_v2", "omni_collective_v1", "v33_final", "qwen_v28"):
+            if key in available:
+                return available[key], "Auto picked the fused catalog model because the prompt asks about model choice."
 
     if wants_vision and vision_models:
         if has_uploaded_image and any(token in lowered for token in ("compare", "explain", "teach", "why", "analyze", "analyse")):
-            for key in ("omni_collective_v1", "science_vision_micro_v1"):
+            for key in ("omni_collective_v2", "omni_collective_v1", "science_vision_micro_v1"):
                 if key in available:
                     return available[key], "Auto picked a vision-capable chat model because an uploaded image needs analysis."
-        for key in ("science_vision_micro_v1", "omni_collective_v1"):
+        for key in ("science_vision_micro_v1", "omni_collective_v2", "omni_collective_v1"):
             if key in available:
                 return available[key], "Auto picked the uploaded-image recognition model because the prompt looks visual."
 
@@ -520,11 +539,6 @@ def choose_auto_model(
         for key in ("v33_final", "v35_final", "v34_final", "qwen_v28"):
             if key in available:
                 return available[key], "Auto picked the strongest benchmarked reasoning/coding text model."
-
-    if any(token in lowered for token in ("which model", "best model", "select a model", "pick a model")):
-        for key in ("omni_collective_v1", "v33_final", "qwen_v28"):
-            if key in available:
-                return available[key], "Auto picked the fused catalog model because the prompt asks about model choice."
 
     if CREATIVE_PROMPT_RE.search(prompt_text):
         for key in ("qwen_v28", "v33_final", "v31_final"):

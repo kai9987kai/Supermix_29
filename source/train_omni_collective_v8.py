@@ -163,6 +163,34 @@ def _load_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _sorted_model_records_v8(models_dir: Path, allowed_model_keys: Optional[Sequence[str]] = None) -> List[ModelRecord]:
+    records = sorted(discover_model_records(models_dir=models_dir), key=lambda item: item.key)
+    if not allowed_model_keys:
+        return records
+    allowed = {str(key) for key in allowed_model_keys}
+    return [record for record in records if record.key in allowed]
+
+
+def _load_frozen_dataset_summary_v8(stage_resume_dir: Path) -> Optional[Dict[str, Any]]:
+    payload = _load_json_if_exists(stage_resume_dir / "dataset_summary.json")
+    if not isinstance(payload, dict):
+        return None
+    summary = payload.get("dataset_summary")
+    if not isinstance(summary, dict):
+        return None
+    resume_artifacts = [
+        _stage_progress_path_v8(stage_resume_dir, "stage1"),
+        _stage_progress_path_v8(stage_resume_dir, "stage2"),
+        _stage_complete_weights_path_v8(stage_resume_dir, "stage1"),
+        _stage_complete_meta_path_v8(stage_resume_dir, "stage1"),
+        _stage_complete_weights_path_v8(stage_resume_dir, "stage2"),
+        _stage_complete_meta_path_v8(stage_resume_dir, "stage2"),
+    ]
+    if not any(path.exists() for path in resume_artifacts):
+        return None
+    return summary
+
+
 def _stage_progress_path_v8(stage_dir: Path, stage_name: str) -> Path:
     return stage_dir / f"{stage_name}_progress.pt"
 
@@ -177,6 +205,90 @@ def _stage_complete_meta_path_v8(stage_dir: Path, stage_name: str) -> Path:
 
 def _clone_state_dict_cpu(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in state_dict.items()}
+
+
+def _stage_progress_temp_path_v8(checkpoint_path: Path) -> Path:
+    return checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+
+
+def _load_stage_progress_checkpoint_v8(checkpoint_path: Path) -> Tuple[Optional[Dict[str, object]], Optional[Path]]:
+    candidates = [checkpoint_path, _stage_progress_temp_path_v8(checkpoint_path)]
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        return None, None
+    existing.sort(key=lambda path: (path.stat().st_mtime, path.name.endswith(".tmp")), reverse=True)
+    last_error: Optional[str] = None
+    for candidate in existing:
+        try:
+            payload = torch.load(candidate, map_location="cpu", weights_only=False)
+            return payload, candidate
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+    if last_error is not None:
+        print(
+            json.dumps(
+                {
+                    "event": "stage_progress_load_warning",
+                    "checkpoint_candidates": [str(path) for path in existing],
+                    "error": last_error,
+                },
+                ensure_ascii=True,
+            ),
+            flush=True,
+        )
+    return None, None
+
+
+def _restore_scheduler_state_v8(
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    scheduler_state: Optional[Dict[str, object]],
+    *,
+    optimizer_steps_done: int,
+    stage_name: str,
+    checkpoint_source: Optional[Path],
+) -> int:
+    state = dict(scheduler_state or {})
+    if not state:
+        return max(0, int(optimizer_steps_done))
+    try:
+        scheduler.load_state_dict(state)
+        resumed_steps = max(
+            0,
+            int(
+                optimizer_steps_done
+                or state.get("_step_count")
+                or state.get("last_epoch")
+                or 0
+            ),
+        )
+        return resumed_steps
+    except Exception as exc:
+        resumed_steps = max(
+            0,
+            int(
+                optimizer_steps_done
+                or state.get("_step_count")
+                or state.get("last_epoch")
+                or 0
+            ),
+        )
+        if resumed_steps > 0:
+            for _ in range(resumed_steps):
+                scheduler.step()
+        print(
+            json.dumps(
+                {
+                    "event": "scheduler_resume_fallback",
+                    "stage": stage_name,
+                    "checkpoint_source": str(checkpoint_source) if checkpoint_source is not None else None,
+                    "resumed_steps": resumed_steps,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                ensure_ascii=True,
+            ),
+            flush=True,
+        )
+        return resumed_steps
 
 
 def _save_stage_progress_checkpoint_v8(
@@ -196,6 +308,8 @@ def _save_stage_progress_checkpoint_v8(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler,
+    save_best_state: bool = False,
+    save_ema_state: bool = False,
 ) -> None:
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -212,12 +326,53 @@ def _save_stage_progress_checkpoint_v8(
         "model_state": _clone_state_dict_cpu(model.state_dict()),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
-        "best_state": _clone_state_dict_cpu(best_state) if best_state is not None else None,
-        "ema_state": _clone_state_dict_cpu(ema_state) if ema_state is not None else None,
+        "best_state": _clone_state_dict_cpu(best_state) if save_best_state and best_state is not None else None,
+        "ema_state": _clone_state_dict_cpu(ema_state) if save_ema_state and ema_state is not None else None,
     }
-    temp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
-    torch.save(payload, temp_path)
-    temp_path.replace(checkpoint_path)
+    temp_path = _stage_progress_temp_path_v8(checkpoint_path)
+    try:
+        torch.save(payload, temp_path)
+    except Exception as exc:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+        print(
+            json.dumps(
+                {
+                    "event": "checkpoint_write_warning",
+                    "checkpoint_path": str(checkpoint_path),
+                    "temp_path": str(temp_path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                ensure_ascii=True,
+            ),
+            flush=True,
+        )
+        return
+    replace_error: Optional[str] = None
+    for attempt in range(8):
+        try:
+            temp_path.replace(checkpoint_path)
+            return
+        except PermissionError as exc:
+            replace_error = f"{type(exc).__name__}: {exc}"
+        except OSError as exc:
+            replace_error = f"{type(exc).__name__}: {exc}"
+        time.sleep(min(0.25 * float(attempt + 1), 2.0))
+    print(
+        json.dumps(
+            {
+                "event": "checkpoint_replace_warning",
+                "checkpoint_path": str(checkpoint_path),
+                "temp_path": str(temp_path),
+                "error": replace_error or "unknown replace error",
+            },
+            ensure_ascii=True,
+        ),
+        flush=True,
+    )
 
 
 def _save_stage_complete_v8(
@@ -462,9 +617,14 @@ def _record_score_fragment(repo_root: Path, record: ModelRecord) -> str:
     return ""
 
 
-def _specialist_profile_rows_v7(repo_root: Path, models_dir: Path, seed: int) -> Tuple[List[OmniRow], Dict[str, object]]:
+def _specialist_profile_rows_v7(
+    repo_root: Path,
+    models_dir: Path,
+    seed: int,
+    allowed_record_keys: Optional[Sequence[str]] = None,
+) -> Tuple[List[OmniRow], Dict[str, object]]:
     del seed
-    records = sorted(discover_model_records(models_dir=models_dir), key=lambda item: item.key)
+    records = _sorted_model_records_v8(models_dir=models_dir, allowed_model_keys=allowed_record_keys)
     rows: List[OmniRow] = []
     family_map: Dict[str, List[str]] = defaultdict(list)
     non_chat_keys: List[str] = []
@@ -683,8 +843,11 @@ def _three_d_rows_v8() -> List[OmniRow]:
     return rows
 
 
-def _cross_modal_selection_rows_v8(models_dir: Path) -> List[OmniRow]:
-    records = {record.key: record for record in discover_model_records(models_dir=models_dir)}
+def _cross_modal_selection_rows_v8(models_dir: Path, allowed_record_keys: Optional[Sequence[str]] = None) -> List[OmniRow]:
+    records = {
+        record.key: record
+        for record in _sorted_model_records_v8(models_dir=models_dir, allowed_model_keys=allowed_record_keys)
+    }
     prompts_and_keys = [
         ("Which local model should I use for benchmark-focused reasoning prompts?", "v40_benchmax"),
         ("Which local model should I use for protein folding prompts?", "protein_folding_micro_v1"),
@@ -903,6 +1066,8 @@ def _all_model_distill_rows_v7(
     seed: int,
     limit: int,
     teacher_model_limit: int,
+    teacher_keys_override: Optional[Sequence[str]] = None,
+    resume_dir_override: Optional[Path] = None,
 ) -> Tuple[List[OmniRow], Dict[str, object]]:
     sample = _sample_teacher_rows(rows, seed=seed, limit=limit)
     if not str(os.environ.get("SUPERMIX_QWEN_BASE_MODEL_DIR") or "").strip():
@@ -910,13 +1075,22 @@ def _all_model_distill_rows_v7(
             os.environ["SUPERMIX_QWEN_BASE_MODEL_DIR"] = str(_resolve_local_qwen_base_model())
         except Exception:
             pass
-    all_records = sorted(discover_model_records(models_dir=models_dir), key=lambda item: item.key)
+    all_records = _sorted_model_records_v8(models_dir=models_dir)
     teacher_records = [record for record in all_records if record.supports_chat and record.key != "omni_collective_v8"]
-    teacher_records.sort(key=lambda item: _teacher_order_key_v7(item.key))
-    if teacher_model_limit > 0:
-        teacher_records = teacher_records[: int(teacher_model_limit)]
+    if teacher_keys_override:
+        teacher_order = {str(key): idx for idx, key in enumerate(teacher_keys_override)}
+        teacher_records = [record for record in teacher_records if record.key in teacher_order]
+        teacher_records.sort(key=lambda item: teacher_order[item.key])
+    else:
+        teacher_records.sort(key=lambda item: _teacher_order_key_v7(item.key))
+        if teacher_model_limit > 0:
+            teacher_records = teacher_records[: int(teacher_model_limit)]
 
-    resume_dir = _teacher_resume_dir_v7(repo_root=repo_root, seed=seed, limit=limit, teacher_keys=[record.key for record in teacher_records])
+    resume_dir = (
+        Path(resume_dir_override).resolve()
+        if resume_dir_override is not None
+        else _teacher_resume_dir_v7(repo_root=repo_root, seed=seed, limit=limit, teacher_keys=[record.key for record in teacher_records])
+    )
     resume_dir.mkdir(parents=True, exist_ok=True)
     sample_path = _teacher_sample_path_v7(resume_dir)
     if sample_path.exists():
@@ -1127,14 +1301,44 @@ def build_training_rows(
     seed: int,
     distill_limit: int,
     teacher_model_limit: int,
+    frozen_dataset_summary: Optional[Dict[str, object]] = None,
 ) -> Tuple[List[OmniRow], List[OmniRow], Dict[str, object]]:
-    full_rows, source_counts = _build_rows_v6(repo_root=repo_root, models_dir=models_dir, images_dir=images_dir, seed=seed)
+    allowed_model_keys: Optional[List[str]] = None
+    teacher_keys_override: Optional[List[str]] = None
+    teacher_resume_dir_override: Optional[Path] = None
+    if isinstance(frozen_dataset_summary, dict):
+        specialist_payload = frozen_dataset_summary.get("specialist_profiles")
+        if isinstance(specialist_payload, dict):
+            record_keys = specialist_payload.get("record_keys")
+            if isinstance(record_keys, list) and record_keys:
+                allowed_model_keys = [str(key) for key in record_keys]
+        teacher_payload = frozen_dataset_summary.get("teacher_league")
+        if isinstance(teacher_payload, dict):
+            teacher_keys = teacher_payload.get("teacher_keys")
+            if isinstance(teacher_keys, list) and teacher_keys:
+                teacher_keys_override = [str(key) for key in teacher_keys]
+            resume_dir_value = str(teacher_payload.get("resume_dir") or "").strip()
+            if resume_dir_value:
+                teacher_resume_dir_override = Path(resume_dir_value).resolve()
+
+    full_rows, source_counts = _build_rows_v6(
+        repo_root=repo_root,
+        models_dir=models_dir,
+        images_dir=images_dir,
+        seed=seed,
+        allowed_model_keys=allowed_model_keys,
+    )
     conversation_rows, conversation_counts = _conversation_expansion_rows_v7(repo_root=repo_root, seed=seed + 601)
     benchmax_rows, benchmax_counts = _benchmax_rows_v7(repo_root=repo_root, seed=seed + 641)
-    specialist_rows, specialist_summary = _specialist_profile_rows_v7(repo_root=repo_root, models_dir=models_dir, seed=seed + 659)
+    specialist_rows, specialist_summary = _specialist_profile_rows_v7(
+        repo_root=repo_root,
+        models_dir=models_dir,
+        seed=seed + 659,
+        allowed_record_keys=allowed_model_keys,
+    )
     materials_rows = _materials_rows_v8()
     three_d_rows = _three_d_rows_v8()
-    cross_modal_rows = _cross_modal_selection_rows_v8(models_dir=models_dir)
+    cross_modal_rows = _cross_modal_selection_rows_v8(models_dir=models_dir, allowed_record_keys=allowed_model_keys)
     grounding_rows = _grounding_rows_v7()
     alignment_rows = _conversation_alignment_rows_v7()
     math_rows = _math_exact_rows_v6(repo_root=repo_root, seed=seed + 677, limit=132)
@@ -1185,6 +1389,8 @@ def build_training_rows(
         seed=seed + 787,
         limit=distill_limit,
         teacher_model_limit=teacher_model_limit,
+        teacher_keys_override=teacher_keys_override,
+        resume_dir_override=teacher_resume_dir_override,
     )
     full_rows.extend(distill_rows)
     source_counts["all_model_distill_total_v7"] = len(distill_rows)
@@ -1328,23 +1534,31 @@ def _train_stage_resumable_v8(
     avg_balance_loss = 0.0
     balance_count = 0
 
-    if progress_path.exists():
-        checkpoint = torch.load(progress_path, map_location="cpu", weights_only=False)
+    checkpoint, checkpoint_source = _load_stage_progress_checkpoint_v8(progress_path)
+    if checkpoint is not None:
         if str(checkpoint.get("stage_name") or "") == stage_name:
             model.load_state_dict(checkpoint["model_state"])
             optimizer.load_state_dict(checkpoint["optimizer_state"])
-            scheduler.load_state_dict(checkpoint["scheduler_state"])
+            optimizer_steps_done = _restore_scheduler_state_v8(
+                scheduler,
+                checkpoint.get("scheduler_state"),
+                optimizer_steps_done=int(checkpoint.get("optimizer_steps_done") or 0),
+                stage_name=stage_name,
+                checkpoint_source=checkpoint_source,
+            )
             if checkpoint.get("best_state") is not None:
                 best_state = checkpoint["best_state"]
-            if checkpoint.get("ema_state") is not None and ema is not None:
-                ema.load_state_dict(checkpoint["ema_state"])
+            if ema is not None:
+                if checkpoint.get("ema_state") is not None:
+                    ema.load_state_dict(checkpoint["ema_state"])
+                else:
+                    ema = ModelEma(model, runtime.ema_decay)
             best_score = float(checkpoint.get("best_score", -1.0))
             history = [dict(item) for item in (checkpoint.get("history") or [])]
             start_epoch = max(1, int(checkpoint.get("epoch") or 1))
             start_batch_index = max(1, int(checkpoint.get("next_batch_index") or 1))
             total_loss = float(checkpoint.get("total_loss") or 0.0)
             total_items = int(checkpoint.get("total_items") or 0)
-            optimizer_steps_done = int(checkpoint.get("optimizer_steps_done") or 0)
             resumed_from_progress = True
             print(
                 json.dumps(
@@ -1355,6 +1569,7 @@ def _train_stage_resumable_v8(
                         "next_batch_index": start_batch_index,
                         "total_batches": total_batches,
                         "checkpoint_path": str(progress_path),
+                        "checkpoint_source": str(checkpoint_source) if checkpoint_source is not None else str(progress_path),
                     },
                     ensure_ascii=True,
                 ),
@@ -1551,6 +1766,8 @@ def _train_stage_resumable_v8(
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
+                    save_best_state=False,
+                    save_ema_state=False,
                 )
                 last_checkpoint_save = now_ts
 
@@ -1571,6 +1788,8 @@ def _train_stage_resumable_v8(
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
+                    save_best_state=False,
+                    save_ema_state=False,
                 )
                 raise RuntimeError("Injected stage interruption for tests.")
 
@@ -1617,6 +1836,8 @@ def _train_stage_resumable_v8(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
+                save_best_state=True,
+                save_ema_state=True,
             )
             last_checkpoint_save = time.time()
 
@@ -1686,13 +1907,15 @@ def train_model(
         teacher_model_limit=int(teacher_model_limit),
     )
     stage_resume_dir.mkdir(parents=True, exist_ok=True)
+    frozen_dataset_summary = _load_frozen_dataset_summary_v8(stage_resume_dir)
     run_state_path = _run_state_path_v8(output_dir)
     _write_run_state_v8(
         run_state_path,
         {
-            "status": "building_dataset",
+            "status": "building_dataset_from_resume" if frozen_dataset_summary is not None else "building_dataset",
             "stage": "dataset",
             "resume_dir": str(stage_resume_dir),
+            "frozen_dataset": bool(frozen_dataset_summary is not None),
         },
     )
     _stage1_rows, full_rows, dataset_summary = build_training_rows(
@@ -1702,6 +1925,7 @@ def train_model(
         seed=seed,
         distill_limit=distill_limit,
         teacher_model_limit=teacher_model_limit,
+        frozen_dataset_summary=frozen_dataset_summary,
     )
     print(json.dumps({"event": "dataset_built", "summary": dataset_summary}, ensure_ascii=True), flush=True)
     _write_json_atomic(stage_resume_dir / "dataset_summary.json", {"dataset_summary": dataset_summary})

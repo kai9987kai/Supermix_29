@@ -137,13 +137,19 @@ def _routing_repair_rows() -> List[OmniRow]:
     ]
 
 
-def _build_large_rows_v4(repo_root: Path, models_dir: Path, images_dir: Path, seed: int) -> Tuple[List[OmniRow], Dict[str, int]]:
+def _build_large_rows_v4(
+    repo_root: Path,
+    models_dir: Path,
+    images_dir: Path,
+    seed: int,
+    allowed_model_keys: Optional[Sequence[str]] = None,
+) -> Tuple[List[OmniRow], Dict[str, int]]:
     datasets_dir = repo_root / "datasets"
     rows: List[OmniRow] = []
     counts: Dict[str, int] = defaultdict(int)
     rows.extend(_curated_rows())
     rows.extend(_routing_repair_rows())
-    rows.extend(_model_selection_rows(models_dir))
+    rows.extend(_model_selection_rows(models_dir, allowed_model_keys=allowed_model_keys))
     rows.extend(_language_rows())
     rows.extend(_image_prompt_rows_v4(seed=seed + 11, limit=340))
     rows.extend(_math_rows(limit=56))

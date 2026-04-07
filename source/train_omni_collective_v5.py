@@ -130,8 +130,20 @@ def _prompt_understanding_rows_v5() -> List[OmniRow]:
     return [OmniRow(prompt=prompt, intent="general" if domain == "general" else ("coding" if domain == "coding" else "planning"), response_text=response, domain=domain if domain in OMNI_DOMAIN_LABELS_V2 else "general", source="prompt_understanding_v5") for prompt, response, domain in items]
 
 
-def _build_rows_v5(repo_root: Path, models_dir: Path, images_dir: Path, seed: int) -> Tuple[List[OmniRow], Dict[str, int]]:
-    rows, source_counts = _build_large_rows_v4(repo_root=repo_root, models_dir=models_dir, images_dir=images_dir, seed=seed)
+def _build_rows_v5(
+    repo_root: Path,
+    models_dir: Path,
+    images_dir: Path,
+    seed: int,
+    allowed_model_keys: Optional[Sequence[str]] = None,
+) -> Tuple[List[OmniRow], Dict[str, int]]:
+    rows, source_counts = _build_large_rows_v4(
+        repo_root=repo_root,
+        models_dir=models_dir,
+        images_dir=images_dir,
+        seed=seed,
+        allowed_model_keys=allowed_model_keys,
+    )
     coding_path = repo_root / "datasets" / "conversation_data.coding_knowledge_2026_02_19.jsonl"
     if coding_path.exists():
         extra_coding = _rows_from_jsonl(coding_path, limit=180, seed=seed + 401, domain="coding", source_tag="coding_delta_jsonl_v5")

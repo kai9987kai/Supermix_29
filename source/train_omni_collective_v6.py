@@ -196,8 +196,20 @@ def _protein_rows_v6(seed: int, limit: int) -> List[OmniRow]:
     return cooked
 
 
-def _build_rows_v6(repo_root: Path, models_dir: Path, images_dir: Path, seed: int) -> Tuple[List[OmniRow], Dict[str, int]]:
-    rows, source_counts = _build_rows_v5(repo_root=repo_root, models_dir=models_dir, images_dir=images_dir, seed=seed)
+def _build_rows_v6(
+    repo_root: Path,
+    models_dir: Path,
+    images_dir: Path,
+    seed: int,
+    allowed_model_keys: Optional[Sequence[str]] = None,
+) -> Tuple[List[OmniRow], Dict[str, int]]:
+    rows, source_counts = _build_rows_v5(
+        repo_root=repo_root,
+        models_dir=models_dir,
+        images_dir=images_dir,
+        seed=seed,
+        allowed_model_keys=allowed_model_keys,
+    )
     conversation_rows, conversation_counts = _conversation_focus_rows_v6(repo_root=repo_root, seed=seed + 401)
     grounding_rows = _grounding_rows_v6()
     alignment_rows = _conversation_alignment_rows_v6()

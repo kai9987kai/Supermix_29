@@ -9,6 +9,8 @@ sys.path.append(os.path.join(os.getcwd(), "source"))
 from training_monitor_gui import (
     RunSnapshot,
     _build_run_recommendation,
+    _build_recovery_outlook,
+    _build_run_rescue_plan,
     _build_run_watch_summary,
     _build_runtime_headline,
     _build_selected_vs_fleet_summary,
@@ -24,6 +26,8 @@ from training_monitor_gui import (
     _resolve_canvas_size,
     _runtime_device_value,
     _summarize_backend_mix,
+    _summarize_fleet_checkpoint_posture,
+    _summarize_fleet_tempo,
     _summarize_fleet_spotlight,
     _summarize_fleet_watchlist,
     _summarize_research_results,
@@ -328,6 +332,58 @@ def test_run_watch_summary_and_runtime_headline():
     assert "stale 0.4m" in runtime
 
 
+def test_recovery_outlook_uses_checkpoint_and_error_context():
+    crashed = _make_snapshot(
+        status="stopped",
+        stage="stage2",
+        pid_alive=False,
+        checkpoint_count=4,
+        last_checkpoint_stage="stage2",
+        last_checkpoint_step=420,
+        save_every_steps=20,
+        err_signal="error",
+        err_summary="disk full",
+    )
+    recovery = _build_recovery_outlook(crashed)
+    assert recovery.startswith("Recovery:")
+    assert "resume from stage2 step 420" in recovery
+    assert "checkpoint cadence 20 steps" in recovery
+    assert "fix the ERR failure" in recovery
+
+    live = _make_snapshot(
+        status="running",
+        stage="sft",
+        pid_alive=True,
+        checkpoint_count=2,
+        last_checkpoint_stage="sft",
+        last_checkpoint_step=80,
+    )
+    live_recovery = _build_recovery_outlook(live)
+    assert "live run" in live_recovery
+    assert "latest durable save is sft step 80" in live_recovery
+
+
+def test_run_rescue_plan_surfaces_resume_and_launch_guidance():
+    snap = _make_snapshot(
+        status="stopped",
+        stage="stage2",
+        pid_alive=False,
+        pid_file=Path("train_sample.pid"),
+        checkpoint_count=3,
+        last_checkpoint_stage="stage2",
+        last_checkpoint_step=512,
+        err_signal="error",
+        err_summary="disk full",
+        launch_command="powershell -File source\\run_train_omni_collective_v8_local.ps1",
+    )
+    rescue = _build_run_rescue_plan(snap)
+    assert rescue.startswith("Rescue Plan:")
+    assert "review ERR tail first" in rescue
+    assert "clear stale pid marker" in rescue
+    assert "resume from stage2 step 512" in rescue
+    assert "relaunch with the saved launch command" in rescue
+
+
 def test_backend_mix_summary():
     cpu_snap = _make_snapshot(run_name="cpu_run", runtime_summary="device=cpu model_dtype=torch.float32")
     dml_snap = _make_snapshot(run_name="dml_run", runtime_summary="device=privateuseone:0 model_dtype=torch.float16")
@@ -338,6 +394,58 @@ def test_backend_mix_summary():
     assert "cpu 1" in summary
     assert "dml 1" in summary
     assert "cuda 1" in summary
+
+
+def test_fleet_checkpoint_posture_summary():
+    safeguarded = _make_snapshot(
+        run_name="run_safe",
+        status="running",
+        checkpoint_count=2,
+        last_checkpoint_stage="sft",
+        last_checkpoint_step=40,
+        pid_alive=True,
+    )
+    fragile = _make_snapshot(run_name="run_fragile", status="running", checkpoint_count=0, pid_alive=True)
+    resumable = _make_snapshot(
+        run_name="run_resume",
+        status="stopped",
+        checkpoint_count=1,
+        last_checkpoint_stage="preference",
+        last_checkpoint_step=12,
+        pid_alive=False,
+    )
+    cold = _make_snapshot(run_name="run_cold", status="stopped", checkpoint_count=0, pid_alive=False)
+    summary = _summarize_fleet_checkpoint_posture([safeguarded, fragile, resumable, cold])
+    assert summary.startswith("Checkpoint Posture:")
+    assert "safeguarded 1" in summary
+    assert "fragile active 1" in summary
+    assert "resumable down 1" in summary
+    assert "cold restart 1" in summary
+
+
+def test_fleet_tempo_summary():
+    fastest = _make_snapshot(
+        run_name="run_fast",
+        status="running",
+        step_rate_per_hour=140.0,
+        checkpoint_eta_seconds=900.0,
+        stale_minutes=0.2,
+        cpu_percent=88.0,
+    )
+    steady = _make_snapshot(
+        run_name="run_steady",
+        status="running",
+        step_rate_per_hour=90.0,
+        checkpoint_eta_seconds=1800.0,
+        stale_minutes=0.5,
+        cpu_percent=42.0,
+    )
+    tempo = _summarize_fleet_tempo([fastest, steady])
+    assert tempo.startswith("Tempo Board:")
+    assert "fastest trainer run_fast 140.0 steps/h" in tempo
+    assert "next checkpoint run_fast 15m" in tempo
+    assert "freshest log run_fast 0.2m stale" in tempo
+    assert "highest host CPU run_fast 88%" in tempo
 
 
 def test_fleet_spotlight_summary():
@@ -633,7 +741,15 @@ if __name__ == "__main__":
         test_canvas_size_resolution,
         test_history_windows,
         test_monitor_focus_and_issue_summaries,
+        test_run_watch_summary_and_runtime_headline,
+        test_recovery_outlook_uses_checkpoint_and_error_context,
+        test_run_rescue_plan_surfaces_resume_and_launch_guidance,
         test_phase_breakdown_rows,
+        test_backend_mix_summary,
+        test_fleet_checkpoint_posture_summary,
+        test_fleet_tempo_summary,
+        test_fleet_spotlight_summary,
+        test_selected_vs_fleet_summary,
         test_eval_filter_fallback_parse,
         test_research_results_summary,
         test_research_failure_insight_uses_sample_summary_and_artifact_path,

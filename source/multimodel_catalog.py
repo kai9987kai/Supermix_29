@@ -283,6 +283,19 @@ MODEL_SPECS: Tuple[ModelSpec, ...] = (
         preferred_meta=("omni_collective_v7_frontier_meta.json",),
     ),
     ModelSpec(
+        key="omni_collective_v8_preview",
+        label="Omni Collective V8 Preview",
+        family="fusion",
+        kind="omni_collective_v8",
+        filename_tokens=("supermix_omni_collective_v8_preview_",),
+        common_row_key=None,
+        capabilities=("chat", "vision"),
+        note="Live preview snapshot exported from the current v8 stage2 checkpoint so it can be inspected and benchmarked before the full run finishes.",
+        benchmark_hint="Interim v8 preview cut from the resumable stage2 checkpoint.",
+        preferred_weights=("omni_collective_v8_preview.pth",),
+        preferred_meta=("omni_collective_v8_preview_meta.json",),
+    ),
+    ModelSpec(
         key="v40_benchmax",
         label="V40 Benchmax",
         family="fusion",
@@ -567,6 +580,32 @@ def _match_token_index(spec: ModelSpec, path: Path) -> Optional[int]:
         if token in name:
             return idx
     return None
+
+
+def describe_model_artifact_name(filename: str) -> Dict[str, object]:
+    cooked = str(filename or "").strip()
+    for spec in MODEL_SPECS:
+        if _match_token_index(spec, Path(cooked)) is not None:
+            return {
+                "known": True,
+                "key": spec.key,
+                "label": spec.label,
+                "family": spec.family,
+                "kind": spec.kind,
+                "capabilities": list(spec.capabilities),
+                "note": spec.note,
+                "benchmark_hint": spec.benchmark_hint,
+            }
+    return {
+        "known": False,
+        "key": "",
+        "label": Path(cooked).stem,
+        "family": "external",
+        "kind": "artifact",
+        "capabilities": [],
+        "note": "Downloadable artifact from the remote Supermix model store.",
+        "benchmark_hint": "",
+    }
 
 
 def _candidate_rank(spec: ModelSpec, path: Path) -> Optional[Tuple[int, int, int, float]]:

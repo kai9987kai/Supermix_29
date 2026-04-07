@@ -13,6 +13,54 @@ class _StubManager:
         self.records = []
         self.generated_dir = zip_path.parent
         self.uploads_dir = zip_path.parent
+        self._store_rows = [
+            {
+                "file_name": "supermix_omni_collective_v8_preview_20260407_001155.zip",
+                "size_bytes": 1647669376,
+                "size_mb": 1571.34,
+                "family": "fusion",
+                "known": True,
+                "model_key": "omni_collective_v8_preview",
+                "label": "Omni Collective V8 Preview",
+                "kind": "omni_collective_v8",
+                "capabilities": ["chat", "vision"],
+                "note": "Preview snapshot.",
+                "benchmark_hint": "Interim preview.",
+                "download_url": "https://example.invalid/v8-preview.zip",
+                "installed": False,
+                "local_path": "",
+                "selectable": False,
+            },
+            {
+                "file_name": "dcgan_v2_in_progress.zip",
+                "size_bytes": 61069961,
+                "size_mb": 58.23,
+                "family": "gan",
+                "known": True,
+                "model_key": "dcgan_v2_in_progress",
+                "label": "DCGAN V2 CIFAR",
+                "kind": "dcgan_image",
+                "capabilities": ["image"],
+                "note": "GAN image model.",
+                "benchmark_hint": "",
+                "download_url": "https://example.invalid/dcgan-v2.zip",
+                "installed": True,
+                "local_path": str(zip_path),
+                "selectable": True,
+            },
+        ]
+        self._jobs = [
+            {
+                "job_id": "store-1",
+                "file_name": "supermix_omni_collective_v8_preview_20260407_001155.zip",
+                "status": "downloading",
+                "downloaded_bytes": 512,
+                "total_bytes": 1024,
+                "started_at": "2026-04-07T18:00:00",
+                "local_path": "",
+                "error": "",
+            }
+        ]
         self._payload = {
             "key": "three_d_generation_micro_v1",
             "label": "3D Generation Micro",
@@ -40,6 +88,28 @@ class _StubManager:
 
     def three_d_model_view(self):
         return dict(self._payload)
+
+    def model_store_catalog(self, force_refresh: bool = False):
+        return {
+            "repo_id": "Kai9987kai/supermix-model-zoo",
+            "model_count": len(self._store_rows),
+            "models": list(self._store_rows),
+        }
+
+    def model_store_jobs(self):
+        return {"jobs": list(self._jobs)}
+
+    def install_model_store_artifact(self, file_name: str):
+        return {
+            "job_id": "store-new",
+            "file_name": file_name,
+            "status": "queued",
+            "downloaded_bytes": 0,
+            "total_bytes": 2048,
+            "started_at": "2026-04-07T18:01:00",
+            "local_path": "",
+            "error": "",
+        }
 
 
 def test_three_d_model_view_endpoint_and_downloads():
@@ -92,3 +162,44 @@ def test_index_contains_discovery_ui():
         assert 'id="capabilityFilter"' in html
         assert 'id="quickPickChips"' in html
         assert 'id="discoveryNote"' in html
+        assert 'id="sessionObjective"' in html
+        assert 'id="savedDrafts"' in html
+        assert 'id="contextBankList"' in html
+        assert 'id="captureLastReplyBtn"' in html
+        assert 'id="threadBookmarks"' in html
+        assert 'id="compareSummary"' in html
+        assert 'id="dispatchPreview"' in html
+        assert 'id="modelStoreList"' in html
+        assert 'id="refreshStoreBtn"' in html
+
+
+def test_model_store_endpoints():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        zip_path = root / "supermix_3d_generation_micro_v1_20260403.zip"
+        summary_path = root / "three_d_generation_micro_v1_summary.json"
+        zip_path.write_bytes(b"zip-bytes")
+        summary_path.write_bytes(b"{}")
+
+        app = build_app(_StubManager(zip_path, summary_path))
+        client = app.test_client()
+
+        store_response = client.get("/api/model_store")
+        assert store_response.status_code == 200
+        store_payload = store_response.get_json()
+        assert store_payload["ok"] is True
+        assert store_payload["repo_id"] == "Kai9987kai/supermix-model-zoo"
+        assert len(store_payload["models"]) == 2
+        assert store_payload["models"][0]["file_name"] == "supermix_omni_collective_v8_preview_20260407_001155.zip"
+
+        jobs_response = client.get("/api/model_store/jobs")
+        assert jobs_response.status_code == 200
+        jobs_payload = jobs_response.get_json()
+        assert jobs_payload["ok"] is True
+        assert jobs_payload["jobs"][0]["status"] == "downloading"
+
+        install_response = client.post("/api/model_store/install", json={"file_name": "supermix_omni_collective_v8_preview_20260407_001155.zip"})
+        assert install_response.status_code == 200
+        install_payload = install_response.get_json()
+        assert install_payload["ok"] is True
+        assert install_payload["job"]["status"] == "queued"

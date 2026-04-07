@@ -29,35 +29,67 @@ $BaseModelDir = $BaseModelDir.Trim()
 $ModelsStageDir = Join-Path $RepoRoot "build\studio_models_stage"
 $BaseModelStageDir = Join-Path $RepoRoot "build\studio_base_model_stage"
 $BundleManifestPath = Join-Path $RepoRoot "output\supermix_studio_bundled_models_manifest.json"
+$BundledModelKeys = @(
+  "v40_benchmax",
+  "omni_collective_v8_preview",
+  "omni_collective_v7",
+  "science_vision_micro_v1",
+  "v38_native_xlite_fp16",
+  "dcgan_v2_in_progress",
+  "math_equation_micro_v1",
+  "protein_folding_micro_v1",
+  "mattergen_micro_v1",
+  "three_d_generation_micro_v1"
+)
 
 if (Test-Path $ModelsStageDir) { Remove-Item -Recurse -Force $ModelsStageDir }
 if (Test-Path $BaseModelStageDir) { Remove-Item -Recurse -Force $BaseModelStageDir }
 New-Item -ItemType Directory -Path $ModelsStageDir -Force | Out-Null
 
-$RedundantBundleNames = @(
-  "champion_v31_hybrid_plus_refresh_bundle_20260326.zip",
-  "champion_v33_frontier_full_bundle_20260326.zip",
-  "qwen_supermix_enhanced_v30_anchor_refresh_20260326_experimental_bundle.zip"
-)
-$ModelZipFiles = Get-ChildItem -Path $ModelsDir -File -Filter *.zip | Where-Object {
-  $_.Name -notmatch ' \(\d+\)\.zip$' -and $RedundantBundleNames -notcontains $_.Name
-}
+$SelectedBundleJson = & $PythonExe -c @"
+import json, sys
+from pathlib import Path
+sys.path.insert(0, 'source')
+from multimodel_catalog import discover_model_records
+records = {record.key: record for record in discover_model_records(models_dir=Path(r'''$ModelsDir'''))}
+keys = [item for item in r'''$($BundledModelKeys -join "`n")'''.splitlines() if item]
+missing = [key for key in keys if key not in records]
+if missing:
+    raise SystemExit('Missing bundled model keys: ' + ', '.join(missing))
+payload = [
+    {
+        'key': key,
+        'label': records[key].label,
+        'name': records[key].zip_path.name,
+        'path': str(records[key].zip_path),
+        'size_bytes': records[key].zip_path.stat().st_size,
+    }
+    for key in keys
+]
+print(json.dumps(payload))
+"@
+$ModelZipFiles = $SelectedBundleJson | ConvertFrom-Json
 if (-not $ModelZipFiles) {
-  throw "No model zip files found in $ModelsDir"
+  throw "No curated model zip files resolved from $ModelsDir"
 }
 foreach ($ZipFile in $ModelZipFiles) {
-  Copy-Item -Force $ZipFile.FullName (Join-Path $ModelsStageDir $ZipFile.Name)
+  Copy-Item -Force $ZipFile.path (Join-Path $ModelsStageDir $ZipFile.name)
 }
 $BundleManifest = [ordered]@{
   generated_at = (Get-Date).ToString("o")
   models_dir = $ModelsDir
+  bundle_strategy = "curated_core_plus_model_store"
   bundled_model_count = @($ModelZipFiles).Count
-  bundled_models = @($ModelZipFiles | Sort-Object Name | ForEach-Object {
+  bundled_model_keys = @($BundledModelKeys)
+  bundled_models = @($ModelZipFiles | ForEach-Object {
       [ordered]@{
-        name = $_.Name
-        size_bytes = $_.Length
+        key = $_.key
+        label = $_.label
+        name = $_.name
+        size_bytes = $_.size_bytes
       }
     })
+  remote_model_store_repo = "Kai9987kai/supermix-model-zoo"
 }
 $BundleManifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 $BundleManifestPath
 

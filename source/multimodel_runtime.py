@@ -11,6 +11,8 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote
+from urllib.request import urlopen
 
 import torch
 from PIL import Image
@@ -23,7 +25,14 @@ from chat_image_variant_app import (
     ImageVariantEngine,
 )
 from device_utils import configure_torch_runtime, resolve_device
-from multimodel_catalog import ModelRecord, choose_auto_model
+from multimodel_catalog import (
+    DEFAULT_COMMON_SUMMARY,
+    DEFAULT_MODELS_DIR,
+    ModelRecord,
+    choose_auto_model,
+    describe_model_artifact_name,
+    discover_model_records,
+)
 from multimodel_memory import ConversationMemoryStore
 from multimodel_tools import (
     CmdOpenTool,
@@ -50,6 +59,7 @@ from omni_collective_v4_model import OmniCollectiveEngineV4
 from omni_collective_v5_model import OmniCollectiveEngineV5
 from omni_collective_v6_model import OmniCollectiveEngineV6
 from omni_collective_v7_model import OmniCollectiveEngineV7
+from omni_collective_v8_model import OmniCollectiveEngineV8
 from run import safe_load_state_dict
 
 
@@ -98,6 +108,14 @@ def _trim_text(text: str, limit: int = 320) -> str:
 def _safe_upload_name(filename: str) -> str:
     cooked = re.sub(r"[^A-Za-z0-9._-]+", "-", str(filename or "").strip()).strip(".-")
     return cooked[:96] or "upload.png"
+
+
+DEFAULT_MODEL_STORE_REPO_ID = "Kai9987kai/supermix-model-zoo"
+MODEL_STORE_CACHE_TTL_SECONDS = 300.0
+
+
+def _hf_dataset_file_url(repo_id: str, filename: str) -> str:
+    return f"https://huggingface.co/datasets/{repo_id}/resolve/main/{quote(filename)}?download=true"
 
 
 def _extract_zip_once(zip_path: Path, extraction_root: Path) -> Path:
@@ -932,6 +950,48 @@ class OmniCollectiveV7Backend(BaseBackend):
         )
 
 
+class OmniCollectiveV8Backend(BaseBackend):
+    def __init__(self, record: ModelRecord, extracted_dir: Path, generated_dir: Path) -> None:
+        super().__init__(record, extracted_dir, generated_dir)
+        weights_path = _find_matching_file(extracted_dir, record.preferred_weights, ".pth")
+        meta_path = _find_matching_file(extracted_dir, record.preferred_meta, ".json")
+        if weights_path is None or meta_path is None:
+            raise FileNotFoundError(f"Missing omnibus weights/meta for {record.label} in {extracted_dir}")
+        self.weights_path = weights_path.resolve()
+        self.meta_path = meta_path.resolve()
+        self.engine = OmniCollectiveEngineV8(weights_path=self.weights_path, meta_path=self.meta_path)
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "backend": "omni_collective_v8",
+            "record": self.record.to_dict(),
+            "weights_path": str(self.weights_path),
+            "meta_path": str(self.meta_path),
+            "runtime": {
+                "device": str(self.engine.device),
+                "image_size": int(self.engine.image_size),
+                "vocab_size": len(self.engine.vocab),
+                "response_count": len(self.engine.responses),
+                "deliberation_passes": int(self.engine.deliberation_passes),
+                "minimum_passes": int(self.engine.minimum_passes),
+            },
+        }
+
+    def chat(self, session_id: str, prompt: str, settings: Dict[str, Any]) -> ChatResult:
+        image_path = str(settings.get("uploaded_image_path") or "").strip()
+        effective_prompt = _compose_text_prompt(prompt, settings)
+        response = self.engine.answer(effective_prompt, image_path=image_path or None)
+        return ChatResult(
+            kind="text",
+            model_key=self.record.key,
+            model_label=self.record.label,
+            route_reason=str(settings.get("route_reason") or ""),
+            response=response,
+            timing={},
+            prompt_used=effective_prompt,
+        )
+
+
 class UnifiedModelManager:
     def __init__(
         self,
@@ -939,6 +999,9 @@ class UnifiedModelManager:
         extraction_root: Path,
         generated_dir: Path,
         device_preference: str = "cuda,npu,xpu,cpu,dml,mps",
+        models_dir: Path = DEFAULT_MODELS_DIR,
+        common_summary_path: Path = DEFAULT_COMMON_SUMMARY,
+        model_store_repo_id: str = DEFAULT_MODEL_STORE_REPO_ID,
     ) -> None:
         configure_torch_runtime(
             torch_num_threads=0,
@@ -949,6 +1012,10 @@ class UnifiedModelManager:
         device, device_info = resolve_device("auto", preference=device_preference)
         self.records = list(records)
         self.record_map = {record.key: record for record in self.records}
+        self.models_dir = Path(models_dir).resolve()
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        self.common_summary_path = Path(common_summary_path).resolve()
+        self.model_store_repo_id = str(model_store_repo_id or DEFAULT_MODEL_STORE_REPO_ID).strip() or DEFAULT_MODEL_STORE_REPO_ID
         self.extraction_root = extraction_root.resolve()
         self.generated_dir = generated_dir.resolve()
         self.uploads_dir = self.extraction_root.parent / "uploads"
@@ -962,6 +1029,9 @@ class UnifiedModelManager:
         self._backend: Optional[BaseBackend] = None
         self._backend_key = ""
         self._lock = threading.RLock()
+        self._model_store_manifest_cache: Optional[Dict[str, Any]] = None
+        self._model_store_manifest_ts = 0.0
+        self._model_store_jobs: Dict[str, Dict[str, Any]] = {}
         self.memory_store = ConversationMemoryStore(self.extraction_root.parent / "memory")
         self.web_search = WebSearchTool()
         self.cmd_open = CmdOpenTool()
@@ -998,6 +1068,8 @@ class UnifiedModelManager:
             return OmniCollectiveV6Backend(record, extracted_dir, self.generated_dir)
         if record.kind == "omni_collective_v7":
             return OmniCollectiveV7Backend(record, extracted_dir, self.generated_dir)
+        if record.kind == "omni_collective_v8":
+            return OmniCollectiveV8Backend(record, extracted_dir, self.generated_dir)
         if record.kind == "qwen_adapter":
             return QwenBackend(record, extracted_dir, self.generated_dir)
         raise RuntimeError(f"Unsupported model kind: {record.kind}")
@@ -1012,6 +1084,189 @@ class UnifiedModelManager:
             self._backend = self._build_backend(record)
             self._backend_key = model_key
             return record, self._backend
+
+    def _refresh_records_locked(self) -> None:
+        refreshed = discover_model_records(
+            models_dir=self.models_dir,
+            common_summary_path=self.common_summary_path,
+        )
+        self.records = list(refreshed)
+        self.record_map = {record.key: record for record in self.records}
+        if self.selected_model_key != "auto" and self.selected_model_key not in self.record_map:
+            self.selected_model_key = "auto"
+        if self._backend_key and self._backend_key not in self.record_map:
+            if self._backend is not None:
+                self._backend.unload()
+            self._backend = None
+            self._backend_key = ""
+
+    def _fetch_model_store_manifest_locked(self, force_refresh: bool = False) -> Dict[str, Any]:
+        now = time.time()
+        if (
+            not force_refresh
+            and self._model_store_manifest_cache is not None
+            and (now - self._model_store_manifest_ts) < MODEL_STORE_CACHE_TTL_SECONDS
+        ):
+            return dict(self._model_store_manifest_cache)
+        url = _hf_dataset_file_url(self.model_store_repo_id, "manifest.json")
+        with urlopen(url, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        self._model_store_manifest_cache = payload
+        self._model_store_manifest_ts = now
+        return dict(payload)
+
+    def model_store_catalog(self, force_refresh: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            manifest = self._fetch_model_store_manifest_locked(force_refresh=force_refresh)
+            installed_names = {record.zip_path.name for record in self.records}
+            rows: List[Dict[str, Any]] = []
+            for item in manifest.get("models") or []:
+                if not isinstance(item, dict):
+                    continue
+                file_name = str(item.get("file_name") or "").strip()
+                if not file_name:
+                    continue
+                details = describe_model_artifact_name(file_name)
+                local_path = self.models_dir / file_name
+                installed = local_path.exists() or file_name in installed_names
+                rows.append(
+                    {
+                        "file_name": file_name,
+                        "size_bytes": int(item.get("size_bytes") or 0),
+                        "size_mb": float(item.get("size_mb") or 0.0),
+                        "family": str(item.get("family") or details.get("family") or "other"),
+                        "known": bool(details.get("known")),
+                        "model_key": str(details.get("key") or ""),
+                        "label": str(details.get("label") or Path(file_name).stem),
+                        "kind": str(details.get("kind") or ""),
+                        "capabilities": list(details.get("capabilities") or []),
+                        "note": str(details.get("note") or ""),
+                        "benchmark_hint": str(details.get("benchmark_hint") or ""),
+                        "download_url": _hf_dataset_file_url(self.model_store_repo_id, file_name),
+                        "installed": installed,
+                        "local_path": str(local_path.resolve()) if local_path.exists() else "",
+                        "selectable": bool(details.get("known")) and str(details.get("key") or "") in self.record_map,
+                    }
+                )
+            rows.sort(key=lambda item: (not item["installed"], item["label"].lower(), item["file_name"].lower()))
+            return {
+                "repo_id": self.model_store_repo_id,
+                "model_count": len(rows),
+                "models": rows,
+            }
+
+    def model_store_jobs(self) -> Dict[str, Any]:
+        with self._lock:
+            jobs = sorted(
+                (dict(job) for job in self._model_store_jobs.values()),
+                key=lambda item: str(item.get("started_at") or ""),
+                reverse=True,
+            )
+            return {"jobs": jobs}
+
+    def _set_model_store_job(self, job_id: str, **updates: Any) -> None:
+        with self._lock:
+            payload = dict(self._model_store_jobs.get(job_id) or {})
+            payload.update(updates)
+            self._model_store_jobs[job_id] = payload
+
+    def _install_model_store_worker(self, job_id: str, file_name: str, expected_size: int) -> None:
+        target = self.models_dir / file_name
+        temp_target = self.models_dir / f"{file_name}.{job_id}.part"
+        try:
+            self._set_model_store_job(job_id, status="downloading")
+            url = _hf_dataset_file_url(self.model_store_repo_id, file_name)
+            downloaded = 0
+            with urlopen(url, timeout=60) as response:
+                header_size = int(response.headers.get("Content-Length") or 0)
+                total_bytes = expected_size or header_size
+                self._set_model_store_job(job_id, total_bytes=total_bytes)
+                with temp_target.open("wb") as handle:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        downloaded += len(chunk)
+                        self._set_model_store_job(job_id, downloaded_bytes=downloaded)
+            if target.exists():
+                target.unlink()
+            temp_target.replace(target)
+            with self._lock:
+                self._refresh_records_locked()
+            self._set_model_store_job(
+                job_id,
+                status="completed",
+                downloaded_bytes=target.stat().st_size,
+                total_bytes=target.stat().st_size,
+                local_path=str(target.resolve()),
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                selectable=bool(describe_model_artifact_name(file_name).get("key") in self.record_map),
+            )
+        except Exception as exc:
+            try:
+                temp_target.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._set_model_store_job(
+                job_id,
+                status="error",
+                error=str(exc),
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+
+    def install_model_store_artifact(self, file_name: str) -> Dict[str, Any]:
+        cooked = str(file_name or "").strip()
+        if not cooked:
+            raise ValueError("file_name is required")
+        with self._lock:
+            manifest = self._fetch_model_store_manifest_locked(force_refresh=False)
+            manifest_rows = {
+                str(item.get("file_name") or "").strip(): item
+                for item in (manifest.get("models") or [])
+                if isinstance(item, dict)
+            }
+            if cooked not in manifest_rows:
+                raise FileNotFoundError(f"{cooked} is not present in {self.model_store_repo_id}")
+            for job in self._model_store_jobs.values():
+                if job.get("file_name") == cooked and job.get("status") in {"queued", "downloading"}:
+                    return dict(job)
+            target = self.models_dir / cooked
+            expected_size = int(manifest_rows[cooked].get("size_bytes") or 0)
+            if target.exists() and (expected_size <= 0 or target.stat().st_size == expected_size):
+                self._refresh_records_locked()
+                payload = {
+                    "job_id": f"already-{int(time.time())}",
+                    "file_name": cooked,
+                    "status": "completed",
+                    "downloaded_bytes": target.stat().st_size,
+                    "total_bytes": target.stat().st_size,
+                    "local_path": str(target.resolve()),
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+                self._model_store_jobs[payload["job_id"]] = payload
+                return payload
+            job_id = f"store-{int(time.time() * 1000)}"
+            payload = {
+                "job_id": job_id,
+                "file_name": cooked,
+                "status": "queued",
+                "downloaded_bytes": 0,
+                "total_bytes": expected_size,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "local_path": "",
+                "error": "",
+            }
+            self._model_store_jobs[job_id] = payload
+            worker = threading.Thread(
+                target=self._install_model_store_worker,
+                args=(job_id, cooked, expected_size),
+                daemon=True,
+                name=f"model-store-{job_id}",
+            )
+            worker.start()
+            return dict(payload)
 
     def _session_scope(self, session_id: str, record_key: str, purpose: str) -> str:
         return f"{session_id}::{purpose}::{record_key}"

@@ -235,9 +235,12 @@ def _curated_rows() -> List[OmniRow]:
     ]
 
 
-def _model_selection_rows(models_dir: Path) -> List[OmniRow]:
+def _model_selection_rows(models_dir: Path, allowed_model_keys: Optional[Sequence[str]] = None) -> List[OmniRow]:
     rows: List[OmniRow] = []
+    allowed = {str(key) for key in allowed_model_keys} if allowed_model_keys else None
     for record in discover_model_records(models_dir=models_dir):
+        if allowed is not None and record.key not in allowed:
+            continue
         score = record.display_score
         score_text = f"{score:.4f}" if score is not None else "specialist"
         response = (

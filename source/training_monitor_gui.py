@@ -2131,6 +2131,69 @@ def _build_runtime_headline(snap: RunSnapshot) -> str:
     return f"Runtime: {device} | CPU {cpu_txt} | RAM {ram_txt} | stale {stale_txt} | {pid_txt}"
 
 
+def _build_recovery_outlook(snap: RunSnapshot) -> str:
+    if snap.status == "running" and snap.pid_alive:
+        if snap.checkpoint_count > 0 and snap.last_checkpoint_step > 0:
+            return (
+                f"Recovery: live run; latest durable save is {snap.last_checkpoint_stage} "
+                f"step {snap.last_checkpoint_step}"
+            )
+        return "Recovery: live run; avoid intervention until a checkpoint lands"
+
+    parts: List[str] = []
+    if snap.checkpoint_count > 0 and snap.last_checkpoint_step > 0:
+        parts.append(f"resume from {snap.last_checkpoint_stage} step {snap.last_checkpoint_step}")
+    elif snap.pref_step > 0 or snap.sft_step > 0 or snap.pref_pairs > 0:
+        parts.append("partial progress is visible in logs, but no durable checkpoint was detected")
+    else:
+        parts.append("no resume checkpoint detected; expect a cold restart")
+
+    if snap.save_every_steps is not None and snap.save_every_steps > 0 and snap.status in {"running", "stalled", "stopped"}:
+        parts.append(f"checkpoint cadence {snap.save_every_steps} steps")
+    if snap.err_signal == "error":
+        parts.append("fix the ERR failure before relaunch")
+    elif snap.status == "stalled":
+        parts.append("capture logs before restarting")
+    elif snap.pid_file is not None and not snap.pid_alive:
+        parts.append("stale pid marker present")
+
+    return "Recovery: " + " | ".join(parts[:4])
+
+
+def _build_run_rescue_plan(snap: RunSnapshot) -> str:
+    if snap.status == "running" and snap.pid_alive:
+        if snap.checkpoint_count > 0 and snap.last_checkpoint_step > 0:
+            return (
+                "Rescue Plan: keep the live run untouched; if it dies, resume from "
+                f"{snap.last_checkpoint_stage} step {snap.last_checkpoint_step}"
+            )
+        return "Rescue Plan: keep the live run untouched; wait for the first durable checkpoint before intervening"
+
+    steps: List[str] = []
+    if snap.err_signal == "error":
+        steps.append("review ERR tail first")
+    elif snap.status == "stalled":
+        steps.append("capture OUT/ERR tails before restart")
+
+    if snap.pid_file is not None and not snap.pid_alive:
+        steps.append("clear stale pid marker")
+
+    if snap.checkpoint_count > 0 and snap.last_checkpoint_step > 0:
+        steps.append(f"resume from {snap.last_checkpoint_stage} step {snap.last_checkpoint_step}")
+    elif snap.pref_step > 0 or snap.sft_step > 0 or snap.pref_pairs > 0:
+        steps.append("expect replay from the last durable save; log-only progress is newer than checkpoint state")
+    else:
+        steps.append("cold restart required")
+
+    launch = str(snap.launch_command or snap.launch_hint or "").strip()
+    if launch:
+        steps.append("relaunch with the saved launch command")
+    else:
+        steps.append("reconstruct the launch command before restarting")
+
+    return "Rescue Plan: " + " | ".join(steps[:4])
+
+
 def _build_run_watch_summary(snap: RunSnapshot) -> str:
     notes: List[str] = []
     device = _runtime_device_value(snap)
@@ -2258,6 +2321,67 @@ def _summarize_fleet_watchlist(snapshots: Sequence[RunSnapshot], limit: int = 3)
     if not items:
         return "Fleet Watch: no operator watch items"
     return "Fleet Watch: " + " | ".join(items)
+
+
+def _summarize_fleet_tempo(snapshots: Sequence[RunSnapshot]) -> str:
+    active = [snap for snap in snapshots if snap.status in {"running", "stalled"}]
+    if not active:
+        return "Tempo Board: -"
+
+    parts: List[str] = []
+
+    fastest = [snap for snap in active if snap.step_rate_per_hour is not None]
+    if fastest:
+        lead = max(fastest, key=lambda snap: float(snap.step_rate_per_hour or 0.0))
+        parts.append(f"fastest trainer {lead.run_name} {float(lead.step_rate_per_hour or 0.0):.1f} steps/h")
+
+    checkpoint_rows = [
+        (snap, float(snap.checkpoint_eta_seconds))
+        for snap in active
+        if snap.checkpoint_eta_seconds is not None
+    ]
+    if checkpoint_rows:
+        next_ckpt_snap, next_ckpt_eta = min(checkpoint_rows, key=lambda item: item[1])
+        parts.append(f"next checkpoint {next_ckpt_snap.run_name} {_fmt_eta(next_ckpt_eta)}")
+
+    freshest = min(active, key=lambda snap: float(snap.stale_minutes))
+    parts.append(f"freshest log {freshest.run_name} {freshest.stale_minutes:.1f}m stale")
+
+    hottest = [snap for snap in active if snap.cpu_percent is not None]
+    if hottest:
+        hot = max(hottest, key=lambda snap: float(snap.cpu_percent or 0.0))
+        parts.append(f"highest host CPU {hot.run_name} {float(hot.cpu_percent or 0.0):.0f}%")
+
+    return "Tempo Board: " + " | ".join(parts[:4])
+
+
+def _summarize_fleet_checkpoint_posture(snapshots: Sequence[RunSnapshot]) -> str:
+    if not snapshots:
+        return "Checkpoint Posture: -"
+
+    safeguarded = 0
+    fragile_active = 0
+    resumable_down = 0
+    cold_restart = 0
+
+    for snap in snapshots:
+        has_checkpoint = snap.checkpoint_count > 0 and snap.last_checkpoint_step > 0
+        active = snap.status in {"running", "stalled"}
+        down = snap.status in {"stopped", "unknown"} or (not snap.pid_alive and snap.status != "finished")
+        if active and has_checkpoint:
+            safeguarded += 1
+        elif active and not has_checkpoint:
+            fragile_active += 1
+        elif down and has_checkpoint:
+            resumable_down += 1
+        elif down and snap.stage != "done":
+            cold_restart += 1
+
+    return (
+        "Checkpoint Posture: "
+        f"safeguarded {safeguarded} | fragile active {fragile_active} | "
+        f"resumable down {resumable_down} | cold restart {cold_restart}"
+    )
 
 
 def _summarize_fleet_spotlight(snapshots: Sequence[RunSnapshot]) -> str:
@@ -2480,6 +2604,8 @@ class TrainingMonitorApp:
         self.selected_focus_var = tk.StringVar(value="Focus: -")
         self.selected_watch_var = tk.StringVar(value="Watch: -")
         self.selected_runtime_var = tk.StringVar(value="Runtime: -")
+        self.selected_recovery_var = tk.StringVar(value="Recovery: -")
+        self.selected_rescue_var = tk.StringVar(value="Rescue Plan: -")
         self.selected_compare_var = tk.StringVar(value="Compare: -")
         self.fleet_progress_var = tk.StringVar(value="Fleet Progress: -")
         self.fleet_eta_var = tk.StringVar(value="Fleet ETA: -")
@@ -2488,6 +2614,8 @@ class TrainingMonitorApp:
         self.fleet_backend_var = tk.StringVar(value="Backend Mix: -")
         self.fleet_watch_var = tk.StringVar(value="Fleet Watch: -")
         self.fleet_spotlight_var = tk.StringVar(value="Spotlight: -")
+        self.fleet_tempo_var = tk.StringVar(value="Tempo Board: -")
+        self.fleet_checkpoint_var = tk.StringVar(value="Checkpoint Posture: -")
         self.research_summary_var = tk.StringVar(value="Research: -")
         self.research_best_var = tk.StringVar(value="Best: -")
         self.research_latest_var = tk.StringVar(value="Latest: -")
@@ -2640,6 +2768,7 @@ class TrainingMonitorApp:
         ttk.Button(filter_row, text="Open Run Dir", command=self._open_selected_run_dir).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(filter_row, text="Copy CMD/Launch", command=self._copy_selected_command).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(filter_row, text="Copy Watch", command=self._copy_selected_watch).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(filter_row, text="Copy Rescue", command=self._copy_selected_rescue).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(filter_row, text="Copy Details", command=self._copy_detail_to_clipboard).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(filter_row, text="Next Issue", command=self._select_next_issue).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(filter_row, text="Export JSON", command=self._export_snapshots_json).pack(side=tk.LEFT, padx=(0, 8))
@@ -2667,8 +2796,12 @@ class TrainingMonitorApp:
         ttk.Label(fleet_notes, textvariable=self.selected_focus_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w")
         ttk.Label(fleet_notes, textvariable=self.selected_watch_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(4, 0))
         ttk.Label(fleet_notes, textvariable=self.selected_runtime_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(4, 0))
+        ttk.Label(fleet_notes, textvariable=self.selected_recovery_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(4, 0))
+        ttk.Label(fleet_notes, textvariable=self.selected_rescue_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(4, 0))
         ttk.Label(fleet_notes, textvariable=self.selected_compare_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(4, 0))
         ttk.Label(fleet_notes, textvariable=self.fleet_spotlight_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(6, 0))
+        ttk.Label(fleet_notes, textvariable=self.fleet_tempo_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(4, 0))
+        ttk.Label(fleet_notes, textvariable=self.fleet_checkpoint_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(4, 0))
         ttk.Label(fleet_notes, textvariable=self.fleet_stage_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(6, 0))
         ttk.Label(fleet_notes, textvariable=self.fleet_backend_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(4, 0))
         ttk.Label(fleet_notes, textvariable=self.fleet_issue_var, justify=tk.LEFT, wraplength=1480).pack(anchor="w", pady=(4, 0))
@@ -3405,6 +3538,8 @@ class TrainingMonitorApp:
             "runtime_summary": snap.runtime_summary,
             "runtime_headline": _build_runtime_headline(snap),
             "watch_summary": _build_run_watch_summary(snap),
+            "recovery_outlook": _build_recovery_outlook(snap),
+            "rescue_plan": _build_run_rescue_plan(snap),
             "adapter_summary": snap.adapter_summary,
             "source_balance_summary": snap.source_balance_summary,
             "objective_summary": snap.objective_summary,
@@ -3450,6 +3585,8 @@ class TrainingMonitorApp:
             self.fleet_progress_var.set("Fleet Progress: -")
             self.fleet_eta_var.set("Fleet ETA: -")
             self.fleet_spotlight_var.set(_summarize_fleet_spotlight(all_snapshots))
+            self.fleet_tempo_var.set("Tempo Board: -")
+            self.fleet_checkpoint_var.set("Checkpoint Posture: -")
             self.fleet_stage_var.set("Stage Mix: -")
             self.fleet_issue_var.set("Issue Radar: -")
             self.fleet_backend_var.set("Backend Mix: -")
@@ -3481,6 +3618,8 @@ class TrainingMonitorApp:
         else:
             self.fleet_eta_var.set("Fleet ETA: -")
         self.fleet_spotlight_var.set(_summarize_fleet_spotlight(all_snapshots))
+        self.fleet_tempo_var.set(_summarize_fleet_tempo(all_snapshots))
+        self.fleet_checkpoint_var.set(_summarize_fleet_checkpoint_posture(all_snapshots))
         self.fleet_stage_var.set(_summarize_stage_mix(all_snapshots))
         self.fleet_backend_var.set(_summarize_backend_mix(all_snapshots))
         self.fleet_issue_var.set(_summarize_issue_runs(all_snapshots))
@@ -3978,6 +4117,7 @@ class TrainingMonitorApp:
             [
                 _build_run_watch_summary(snap),
                 _build_runtime_headline(snap),
+                _build_recovery_outlook(snap),
                 f"Focus: {_build_run_recommendation(snap)}",
             ]
         ).strip()
@@ -3987,6 +4127,26 @@ class TrainingMonitorApp:
             self.root.clipboard_clear()
             self.root.clipboard_append(payload)
             self.status_var.set(f"Copied watch summary for {snap.run_name}")
+        except Exception:
+            pass
+
+    def _copy_selected_rescue(self) -> None:
+        snap = self._selected_snapshot()
+        if snap is None:
+            return
+        payload = "\n".join(
+            [
+                _build_recovery_outlook(snap),
+                _build_run_rescue_plan(snap),
+                f"Launch: {snap.launch_command or snap.launch_hint or '-'}",
+            ]
+        ).strip()
+        if not payload:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(payload)
+            self.status_var.set(f"Copied rescue plan for {snap.run_name}")
         except Exception:
             pass
 
@@ -4083,6 +4243,8 @@ class TrainingMonitorApp:
             self.selected_focus_var.set("Focus: -")
             self.selected_watch_var.set("Watch: -")
             self.selected_runtime_var.set("Runtime: -")
+            self.selected_recovery_var.set("Recovery: -")
+            self.selected_rescue_var.set("Rescue Plan: -")
             self.selected_compare_var.set("Compare: -")
             self._draw_phase_breakdown(None)
 
@@ -4129,6 +4291,8 @@ class TrainingMonitorApp:
             self.selected_focus_var.set("Focus: -")
             self.selected_watch_var.set("Watch: -")
             self.selected_runtime_var.set("Runtime: -")
+            self.selected_recovery_var.set("Recovery: -")
+            self.selected_rescue_var.set("Rescue Plan: -")
             self.selected_compare_var.set("Compare: -")
             self._draw_selected_trend(None)
             self._draw_phase_breakdown(None)
@@ -4143,6 +4307,8 @@ class TrainingMonitorApp:
             self.selected_focus_var.set("Focus: -")
             self.selected_watch_var.set("Watch: -")
             self.selected_runtime_var.set("Runtime: -")
+            self.selected_recovery_var.set("Recovery: -")
+            self.selected_rescue_var.set("Rescue Plan: -")
             self.selected_compare_var.set("Compare: -")
             self._draw_selected_trend(None)
             self._draw_phase_breakdown(None)
@@ -4184,6 +4350,10 @@ class TrainingMonitorApp:
         self.selected_watch_var.set(watch_summary)
         runtime_headline = _build_runtime_headline(snap)
         self.selected_runtime_var.set(runtime_headline)
+        recovery_outlook = _build_recovery_outlook(snap)
+        self.selected_recovery_var.set(recovery_outlook)
+        rescue_plan = _build_run_rescue_plan(snap)
+        self.selected_rescue_var.set(rescue_plan)
         compare_summary = _build_selected_vs_fleet_summary(snap, list(self.current_snapshots.values()))
         self.selected_compare_var.set(compare_summary)
 
@@ -4204,6 +4374,8 @@ class TrainingMonitorApp:
             f"focus: {recommendation}",
             f"watch: {watch_summary.replace('Watch: ', '', 1)}",
             f"runtime: {runtime_headline.replace('Runtime: ', '', 1)}",
+            f"recovery: {recovery_outlook.replace('Recovery: ', '', 1)}",
+            f"rescue_plan: {rescue_plan.replace('Rescue Plan: ', '', 1)}",
             f"compare: {compare_summary.replace('Compare: ', '', 1)}",
             f"stage: {snap.stage}",
             f"pid: {snap.pid if snap.pid is not None else '-'} (alive={snap.pid_alive}, source={snap.pid_source or '-'})",

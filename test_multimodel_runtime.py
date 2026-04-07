@@ -23,7 +23,7 @@ def _record(key: str, kind: str, capabilities: tuple[str, ...], score: float | N
     )
 
 
-def test_collective_panel_includes_omni_collective_v2_v3_v4_v5_v6_v7_v40_and_domain_specialists(tmp_path: Path) -> None:
+def test_collective_panel_includes_omni_collective_v2_v3_v4_v5_v6_v7_v8_preview_v40_and_domain_specialists(tmp_path: Path) -> None:
     records = (
         _record("v33_final", "champion_chat", ("chat",), 0.18),
         _record("protein_folding_micro_v1", "protein_folding", ("chat",), None),
@@ -35,6 +35,7 @@ def test_collective_panel_includes_omni_collective_v2_v3_v4_v5_v6_v7_v40_and_dom
         _record("omni_collective_v5", "omni_collective_v5", ("chat", "vision"), None),
         _record("omni_collective_v6", "omni_collective_v6", ("chat", "vision"), None),
         _record("omni_collective_v7", "omni_collective_v7", ("chat", "vision"), 0.1067),
+        _record("omni_collective_v8_preview", "omni_collective_v8", ("chat", "vision"), None),
         _record("v40_benchmax", "omni_collective_v5", ("chat", "vision"), None),
         _record("science_vision_micro_v1", "image_recognition", ("chat", "vision"), None),
         _record("v38_native_xlite_fp16", "native_image", ("image",), 0.01),
@@ -55,6 +56,7 @@ def test_collective_panel_includes_omni_collective_v2_v3_v4_v5_v6_v7_v40_and_dom
     assert "omni_collective_v5" in keys
     assert "omni_collective_v6" in keys
     assert "omni_collective_v7" in keys
+    assert "omni_collective_v8_preview" in keys
     assert "v40_benchmax" in keys
     assert "v38_native_xlite_fp16" not in keys
 
@@ -77,3 +79,34 @@ def test_default_text_record_prefers_v40_benchmax(tmp_path: Path) -> None:
     )
     chosen = manager._default_text_record()
     assert chosen.key == "v40_benchmax"
+
+
+def test_model_store_catalog_marks_installed_and_selectable_records(tmp_path: Path) -> None:
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    installed = models_dir / "dcgan_v2_in_progress.zip"
+    installed.write_bytes(b"zip")
+    records = (
+        _record("dcgan_v2_in_progress", "dcgan_image", ("image",), None),
+    )
+    manager = UnifiedModelManager(
+        records=records,
+        extraction_root=tmp_path / "extract",
+        generated_dir=tmp_path / "generated",
+        models_dir=models_dir,
+        common_summary_path=tmp_path / "missing_summary.json",
+    )
+
+    manager._fetch_model_store_manifest_locked = lambda force_refresh=False: {  # type: ignore[method-assign]
+        "models": [
+            {"file_name": "dcgan_v2_in_progress.zip", "size_bytes": 3, "size_mb": 0.0, "family": "gan"},
+            {"file_name": "supermix_omni_collective_v8_preview_20260407_001155.zip", "size_bytes": 10, "size_mb": 0.0, "family": "fusion"},
+        ]
+    }
+
+    payload = manager.model_store_catalog(force_refresh=True)
+    by_name = {row["file_name"]: row for row in payload["models"]}
+    assert by_name["dcgan_v2_in_progress.zip"]["installed"] is True
+    assert by_name["dcgan_v2_in_progress.zip"]["selectable"] is True
+    assert by_name["supermix_omni_collective_v8_preview_20260407_001155.zip"]["known"] is True
+    assert by_name["supermix_omni_collective_v8_preview_20260407_001155.zip"]["installed"] is False

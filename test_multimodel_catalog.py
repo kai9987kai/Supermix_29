@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from source.multimodel_catalog import ModelRecord, choose_auto_model
+from source.multimodel_catalog import ModelRecord, choose_auto_model, describe_model_artifact_name
 
 
 def _record(key: str, kind: str, capabilities: tuple[str, ...], score: float | None = None) -> ModelRecord:
@@ -133,6 +133,7 @@ def test_auto_prefers_uploaded_image_specialist() -> None:
 def test_auto_prefers_newer_omni_collective_for_model_choice_prompt() -> None:
     records = [
         _record("v33_final", "champion_chat", ("chat",), 0.18),
+        _record("omni_collective_v8_preview", "omni_collective_v8", ("chat", "vision"), None),
         _record("omni_collective_v7", "omni_collective_v7", ("chat", "vision"), 0.1067),
         _record("omni_collective_v6", "omni_collective_v6", ("chat", "vision"), None),
         _record("v40_benchmax", "omni_collective_v5", ("chat", "vision"), None),
@@ -151,6 +152,7 @@ def test_auto_prefers_newer_omni_collective_for_model_choice_prompt() -> None:
 def test_auto_prefers_v40_for_reasoning_prompt() -> None:
     records = [
         _record("v33_final", "champion_chat", ("chat",), 0.18),
+        _record("omni_collective_v8_preview", "omni_collective_v8", ("chat", "vision"), None),
         _record("omni_collective_v7", "omni_collective_v7", ("chat", "vision"), 0.1067),
         _record("omni_collective_v6", "omni_collective_v6", ("chat", "vision"), None),
         _record("v40_benchmax", "omni_collective_v5", ("chat", "vision"), None),
@@ -163,3 +165,26 @@ def test_auto_prefers_v40_for_reasoning_prompt() -> None:
     assert chosen is not None
     assert chosen.key == "v40_benchmax"
     assert "reasoning" in reason.lower() or "strongest" in reason.lower()
+
+
+def test_auto_does_not_promote_v8_preview_over_default_reasoning_route() -> None:
+    records = [
+        _record("omni_collective_v8_preview", "omni_collective_v8", ("chat", "vision"), None),
+        _record("v40_benchmax", "omni_collective_v5", ("chat", "vision"), None),
+        _record("omni_collective_v6", "omni_collective_v6", ("chat", "vision"), None),
+    ]
+    chosen, reason = choose_auto_model(records, "Analyze this benchmark tradeoff and recommend the best local reasoning model.")
+    assert chosen is not None
+    assert chosen.key == "v40_benchmax"
+    assert "reasoning" in reason.lower() or "strongest" in reason.lower()
+
+
+def test_describe_model_artifact_name_identifies_known_and_unknown_artifacts() -> None:
+    known = describe_model_artifact_name("supermix_omni_collective_v8_preview_20260407_001155.zip")
+    assert known["known"] is True
+    assert known["key"] == "omni_collective_v8_preview"
+    assert "chat" in known["capabilities"]
+
+    unknown = describe_model_artifact_name("totally_custom_external_model.zip")
+    assert unknown["known"] is False
+    assert unknown["label"] == "totally_custom_external_model"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -212,6 +213,98 @@ def test_warmup_cosine_scheduler_changes_lr():
     assert lrs[-1] >= 0.2
 
 
+def test_restore_scheduler_state_v8_falls_back_for_legacy_state():
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW([parameter], lr=1.0)
+    scheduler = train_v8.create_warmup_cosine_scheduler(
+        optimizer,
+        total_steps=10,
+        warmup_steps=0,
+        warmup_ratio=0.0,
+        min_lr_scale=0.2,
+    )
+    legacy_state = {
+        "T_max": 10,
+        "eta_min": 0.0,
+        "base_lrs": [1.0],
+        "last_epoch": 4,
+        "_step_count": 5,
+        "_get_lr_called_within_step": False,
+        "_last_lr": [0.6],
+    }
+    resumed_steps = train_v8._restore_scheduler_state_v8(
+        scheduler,
+        legacy_state,
+        optimizer_steps_done=0,
+        stage_name="stage1",
+        checkpoint_source=Path("legacy.pt"),
+    )
+    assert resumed_steps == 5
+    assert float(optimizer.param_groups[0]["lr"]) < 1.0
+
+
+def test_build_training_rows_uses_frozen_dataset_summary_overrides(monkeypatch, tmp_path):
+    base_row = OmniRow(prompt="P", intent="general", response_text="R", domain="general", source="base")
+    recorded: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        train_v8,
+        "_build_rows_v6",
+        lambda repo_root, models_dir, images_dir, seed, allowed_model_keys=None: (
+            [base_row],
+            {"base": 1, "allowed_count": len(allowed_model_keys or [])},
+        ),
+    )
+    monkeypatch.setattr(train_v8, "_conversation_expansion_rows_v7", lambda repo_root, seed: ([], {}))
+    monkeypatch.setattr(train_v8, "_benchmax_rows_v7", lambda repo_root, seed: ([], {}))
+    monkeypatch.setattr(
+        train_v8,
+        "_specialist_profile_rows_v7",
+        lambda repo_root, models_dir, seed, allowed_record_keys=None: ([], {"record_keys": list(allowed_record_keys or [])}),
+    )
+    monkeypatch.setattr(train_v8, "_materials_rows_v8", lambda: [])
+    monkeypatch.setattr(train_v8, "_three_d_rows_v8", lambda: [])
+    monkeypatch.setattr(train_v8, "_cross_modal_selection_rows_v8", lambda models_dir, allowed_record_keys=None: [])
+    monkeypatch.setattr(train_v8, "_grounding_rows_v7", lambda: [])
+    monkeypatch.setattr(train_v8, "_conversation_alignment_rows_v7", lambda: [])
+    monkeypatch.setattr(train_v8, "_math_exact_rows_v6", lambda repo_root, seed, limit: [])
+    monkeypatch.setattr(train_v8, "_protein_rows_v6", lambda seed, limit: [])
+    monkeypatch.setattr(train_v8, "build_protein_folding_rows", lambda seed, max_rows: ([], {"selected_rows": 0}))
+
+    def _fake_distill(rows, *, repo_root, models_dir, seed, limit, teacher_model_limit, teacher_keys_override=None, resume_dir_override=None):
+        recorded["teacher_keys_override"] = list(teacher_keys_override or [])
+        recorded["resume_dir_override"] = str(resume_dir_override) if resume_dir_override is not None else None
+        return [], {"accepted_total": 0, "teacher_keys": list(teacher_keys_override or []), "resume_dir": recorded["resume_dir_override"]}
+
+    monkeypatch.setattr(train_v8, "_all_model_distill_rows_v7", _fake_distill)
+
+    frozen_summary = {
+        "teacher_league": {
+            "teacher_keys": ["v40_benchmax", "qwen_v28"],
+            "resume_dir": str((tmp_path / "teacher_resume").resolve()),
+        },
+        "specialist_profiles": {
+            "record_keys": ["omni_collective_v7", "v40_benchmax"],
+        },
+    }
+
+    stage1_rows, full_rows, summary = train_v8.build_training_rows(
+        repo_root=tmp_path,
+        models_dir=tmp_path,
+        images_dir=tmp_path,
+        seed=1,
+        distill_limit=4,
+        teacher_model_limit=0,
+        frozen_dataset_summary=frozen_summary,
+    )
+
+    assert len(stage1_rows) == 1
+    assert len(full_rows) == 1
+    assert recorded["teacher_keys_override"] == ["v40_benchmax", "qwen_v28"]
+    assert recorded["resume_dir_override"] == str((tmp_path / "teacher_resume").resolve())
+    assert summary["source_counts"]["allowed_count"] == 2
+
+
 def test_train_stage_resumable_v8_recovers_from_saved_progress(tmp_path):
     train_rows = [
         OmniRow(prompt="Explain why tests matter.", intent="general", response_text="Tests catch regressions early.", domain="general", source="t"),
@@ -347,3 +440,101 @@ def test_train_stage_resumable_v8_recovers_from_saved_progress(tmp_path):
     assert train_v8._stage_complete_weights_path_v8(stage_dir, "stage1").exists()
     assert train_v8._stage_complete_meta_path_v8(stage_dir, "stage1").exists()
     assert not train_v8._stage_progress_path_v8(stage_dir, "stage1").exists()
+
+
+def test_stage_progress_loader_prefers_newer_tmp_checkpoint(tmp_path):
+    checkpoint_path = tmp_path / "stage1_progress.pt"
+    temp_path = train_v8._stage_progress_temp_path_v8(checkpoint_path)
+    older_payload = {
+        "stage_name": "stage1",
+        "epoch": 1,
+        "next_batch_index": 5,
+        "total_batches": 20,
+        "total_loss": 1.0,
+        "total_items": 4,
+        "optimizer_steps_done": 2,
+        "best_score": 0.1,
+        "history": [],
+        "saved_at": "older",
+        "model_state": {},
+        "optimizer_state": {},
+        "scheduler_state": {},
+        "best_state": None,
+        "ema_state": None,
+    }
+    newer_payload = dict(older_payload)
+    newer_payload["next_batch_index"] = 11
+    newer_payload["saved_at"] = "newer"
+    torch.save(older_payload, checkpoint_path)
+    time.sleep(0.05)
+    torch.save(newer_payload, temp_path)
+    payload, source = train_v8._load_stage_progress_checkpoint_v8(checkpoint_path)
+    assert payload is not None
+    assert payload["next_batch_index"] == 11
+    assert source == temp_path
+
+
+def test_stage_progress_save_survives_replace_permission_error(monkeypatch, tmp_path):
+    checkpoint_path = tmp_path / "stage1_progress.pt"
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+
+    def _raise_permission_error(self, target):
+        raise PermissionError("locked for test")
+
+    monkeypatch.setattr(Path, "replace", _raise_permission_error)
+    train_v8._save_stage_progress_checkpoint_v8(
+        checkpoint_path=checkpoint_path,
+        stage_name="stage1",
+        epoch=1,
+        next_batch_index=2,
+        total_batches=10,
+        total_loss=1.25,
+        total_items=4,
+        optimizer_steps_done=1,
+        best_score=0.2,
+        best_state=None,
+        ema_state=None,
+        history=[],
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
+    temp_path = train_v8._stage_progress_temp_path_v8(checkpoint_path)
+    assert temp_path.exists()
+    payload, source = train_v8._load_stage_progress_checkpoint_v8(checkpoint_path)
+    assert payload is not None
+    assert payload["next_batch_index"] == 2
+    assert source == temp_path
+
+
+def test_stage_progress_save_survives_torch_save_failure(monkeypatch, tmp_path):
+    checkpoint_path = tmp_path / "stage1_progress.pt"
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+
+    def _raise_save(*args, **kwargs):
+        raise RuntimeError("disk full for test")
+
+    monkeypatch.setattr(torch, "save", _raise_save)
+    train_v8._save_stage_progress_checkpoint_v8(
+        checkpoint_path=checkpoint_path,
+        stage_name="stage1",
+        epoch=1,
+        next_batch_index=2,
+        total_batches=10,
+        total_loss=1.25,
+        total_items=4,
+        optimizer_steps_done=1,
+        best_score=0.2,
+        best_state=None,
+        ema_state=None,
+        history=[],
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
+    assert not checkpoint_path.exists()
+    assert not train_v8._stage_progress_temp_path_v8(checkpoint_path).exists()

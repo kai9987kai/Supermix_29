@@ -6,6 +6,7 @@ import base64
 import html
 import logging
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -55,7 +56,7 @@ LOADING_HTML = """<!doctype html>
   .box{margin-top:18px;padding:16px;border-radius:16px;background:#07111b;border:1px solid rgba(135,164,203,.14);white-space:pre-wrap;
     color:#d5e5f9;font-family:Consolas,"Cascadia Code",monospace;font-size:12px;line-height:1.55}
 </style></head>
-<body><div class="card"><div class="eyebrow">Bundled Local Runtime</div><h1>Starting Supermix Studio</h1><p>The desktop shell is bringing up the embedded multimodel server and will switch into the live interface as soon as it reports ready.</p><div class="box">__STATUS__</div></div></body></html>
+<body><div class="card"><div class="eyebrow">Curated Core + Model Store</div><h1>Starting Supermix Studio</h1><p>The desktop shell is bringing up the embedded multimodel server. Core models are seeded locally, and any extra models can be installed later from the in-app store.</p><div class="box">__STATUS__</div></div></body></html>
 """
 
 
@@ -80,14 +81,31 @@ def resolve_runtime_path(relative_path: Path) -> Optional[Path]:
     return None
 
 
-def resolve_models_dir(explicit_models_dir: str) -> Path:
+def resolve_models_dir(explicit_models_dir: str, state_dir: Path) -> Path:
     raw = str(explicit_models_dir or "").strip()
     if raw:
-        return Path(raw).expanduser().resolve()
+        target = Path(raw).expanduser().resolve()
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    target = (state_dir / "models").resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def hydrate_bundled_models(models_dir: Path) -> Path:
     bundled = resolve_runtime_path(Path("bundled_models"))
-    if bundled is not None:
-        return bundled
-    return DEFAULT_MODELS_DIR.resolve()
+    if bundled is None or not bundled.exists():
+        return models_dir
+    models_dir.mkdir(parents=True, exist_ok=True)
+    for zip_path in sorted(bundled.glob("*.zip")):
+        target = models_dir / zip_path.name
+        try:
+            if target.exists() and target.stat().st_size == zip_path.stat().st_size:
+                continue
+            shutil.copy2(zip_path, target)
+        except Exception:
+            logging.exception("Failed to hydrate bundled model %s into %s", zip_path, target)
+    return models_dir
 
 
 def resolve_runtime_state_dir() -> Path:
@@ -151,6 +169,7 @@ def build_manager(models_dir: Path, state_dir: Path, device_preference: str) -> 
     bundled_base = find_bundled_base_model_dir()
     if bundled_base is not None:
         os.environ["SUPERMIX_QWEN_BASE_MODEL_DIR"] = str(bundled_base)
+    models_dir = hydrate_bundled_models(models_dir)
     records = tuple(discover_model_records(models_dir=models_dir))
     if not records:
         raise RuntimeError(f"No supported model zips were found in {models_dir}")
@@ -159,6 +178,7 @@ def build_manager(models_dir: Path, state_dir: Path, device_preference: str) -> 
         extraction_root=state_dir / "extracted_models",
         generated_dir=state_dir / "generated_images",
         device_preference=device_preference,
+        models_dir=models_dir,
     )
 
 
@@ -186,7 +206,7 @@ def main() -> None:
     )
     configure_logging(log_path)
 
-    models_dir = resolve_models_dir(args.models_dir)
+    models_dir = resolve_models_dir(args.models_dir, state_dir)
     manager = build_manager(models_dir=models_dir, state_dir=state_dir, device_preference=str(args.device_preference))
     app = build_app(manager)
     port = choose_port(args.host, args.port)

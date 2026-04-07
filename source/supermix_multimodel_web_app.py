@@ -8,7 +8,7 @@ from typing import Any, Dict
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from multimodel_catalog import DEFAULT_MODELS_DIR, discover_model_records, models_to_json
+from multimodel_catalog import DEFAULT_COMMON_SUMMARY, DEFAULT_MODELS_DIR, discover_model_records, models_to_json
 from multimodel_runtime import UnifiedModelManager
 from qwen_chat_desktop_app import BASE_MODEL_OVERRIDE_ENV
 
@@ -111,6 +111,27 @@ HTML = """<!doctype html>
     .thread-kpi{padding:10px 11px;border-radius:12px;border:1px solid rgba(255,255,255,.05);background:rgba(255,255,255,.03)}
     .thread-kpi .k{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:700}
     .thread-kpi .v{margin-top:6px;font-size:18px;font-family:"Bahnschrift","Segoe UI Semibold",sans-serif}
+    .dispatch-box,.draft-list,.compare-slot,.context-list,.bookmark-list{padding:12px 13px;border-radius:var(--r-md);border:1px solid rgba(255,255,255,.06);background:rgba(4,10,16,.76)}
+    .dispatch-box{color:#d7e6fb;font-size:12px;line-height:1.55}
+    .dispatch-box strong{display:block;margin-bottom:8px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+    .draft-list{display:grid;gap:8px;max-height:240px;overflow:auto}
+    .draft-item{padding:11px 12px;border-radius:14px;border:1px solid rgba(255,255,255,.05);background:rgba(255,255,255,.03)}
+    .draft-item-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+    .draft-item-title{font-size:13px;font-weight:700;color:#eef5ff}
+    .draft-item-sub{margin-top:6px;font-size:12px;color:var(--muted);line-height:1.5;white-space:pre-wrap}
+    .draft-item-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+    .compare-slot{display:grid;gap:6px;color:#d7e6fb}
+    .compare-slot.empty{color:var(--muted);opacity:.78}
+    .compare-slot .slot-head{display:flex;justify-content:space-between;gap:10px;align-items:center}
+    .compare-slot .slot-label{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:700}
+    .compare-slot .slot-meta{font-size:12px;color:#d7e6fb}
+    .compare-slot .slot-body{font-size:12px;line-height:1.55;white-space:pre-wrap}
+    .context-list,.bookmark-list{display:grid;gap:8px;max-height:220px;overflow:auto}
+    .context-item,.bookmark-item{padding:11px 12px;border-radius:14px;border:1px solid rgba(255,255,255,.05);background:rgba(255,255,255,.03)}
+    .context-item-title,.bookmark-item-title{font-size:12px;font-weight:700;color:#eef5ff}
+    .context-item-sub,.bookmark-item-sub{margin-top:6px;font-size:12px;color:var(--muted);line-height:1.5;white-space:pre-wrap}
+    .context-item-actions,.bookmark-item-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+    .msg.bookmarked{box-shadow:0 0 0 1px rgba(255,179,102,.38),0 10px 28px rgba(0,0,0,.16)}
     .focus-chip{cursor:pointer}
     .focus-chip.active{border-color:rgba(112,184,255,.36);background:rgba(112,184,255,.10)}
     .msg.dim{opacity:.28;transform:scale(.992)}
@@ -181,7 +202,16 @@ HTML = """<!doctype html>
           </select>
         </div>
         <div class="chip-row" id="quickPickChips"></div>
-        <div class="note" id="discoveryNote">Use search and capability filters to narrow the bundled model catalog.</div>
+        <div class="note" id="discoveryNote">Use search and capability filters to narrow the installed model catalog.</div>
+      </section>
+
+      <section class="card">
+        <h2>Model Store</h2>
+        <div class="action-row">
+          <button class="ghost" id="refreshStoreBtn">Refresh Store</button>
+        </div>
+        <div class="note" id="modelStoreNote">Browse every published Supermix artifact from Hugging Face and install it into the local model directory.</div>
+        <div class="draft-list" id="modelStoreList">Loading remote store...</div>
       </section>
 
       <section class="card">
@@ -262,6 +292,54 @@ HTML = """<!doctype html>
       </section>
 
       <section class="card">
+        <h2>Session Brief</h2>
+        <div class="field">
+          <label>Objective</label>
+          <input id="sessionObjective" placeholder="What is this chat trying to achieve?">
+        </div>
+        <div class="field">
+          <label>Constraints</label>
+          <textarea id="sessionConstraints" placeholder="Deadlines, limits, must-use tools, style constraints, or facts to preserve."></textarea>
+        </div>
+        <div class="field">
+          <label>Done Looks Like</label>
+          <input id="sessionDone" placeholder="What would count as a good final answer?">
+        </div>
+        <div class="action-row">
+          <button class="ghost" id="applyBriefBtn">Apply To Hint</button>
+          <button class="ghost" id="clearBriefBtn">Clear Brief</button>
+        </div>
+        <div class="note" id="sessionBriefNote">Keep a compact working brief here. It can be folded into the next prompt without rewriting it every time.</div>
+      </section>
+
+      <section class="card">
+        <h2>Draft Shelf</h2>
+        <div class="field">
+          <label>Draft Label</label>
+          <input id="draftLabel" placeholder="Optional label for the current prompt draft">
+        </div>
+        <div class="action-row">
+          <button class="ghost" id="saveDraftBtn">Save Draft</button>
+          <button class="ghost" id="insertLatestDraftBtn">Insert Latest</button>
+        </div>
+        <div class="draft-list" id="savedDrafts">No saved drafts yet.</div>
+      </section>
+
+      <section class="card">
+        <h2>Context Bank</h2>
+        <div class="field">
+          <label>Manual Context Note</label>
+          <textarea id="contextNoteInput" placeholder="Save a fact, requirement, or constraint you want to keep on hand."></textarea>
+        </div>
+        <div class="action-row">
+          <button class="ghost" id="addContextNoteBtn">Add Note</button>
+          <button class="ghost" id="captureLastReplyBtn">Capture Last Reply</button>
+          <button class="ghost" id="clearContextBankBtn">Clear Context</button>
+        </div>
+        <div class="context-list" id="contextBankList">No saved context yet.</div>
+      </section>
+
+      <section class="card">
         <h2>Exports</h2>
         <div class="field">
           <label>Save Path</label>
@@ -293,6 +371,23 @@ HTML = """<!doctype html>
             <button class="ghost" id="downloadThreadBtn">Download JSON</button>
           </div>
           <div class="note">Filter dims non-matching messages. Copy and download actions use the live session transcript you see in the thread.</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Thread Navigator</h2>
+        <div class="bookmark-list" id="threadBookmarks">No bookmarks yet.</div>
+        <div class="note" id="bookmarkNote">Bookmark a message in the thread to jump back to it later.</div>
+      </section>
+
+      <section class="card">
+        <h2>Compare Bench</h2>
+        <div class="compare-slot empty" id="compareSlotA">Pin an assistant reply into slot A to compare models, tone, or route decisions.</div>
+        <div class="compare-slot empty" id="compareSlotB" style="margin-top:10px">Pin a second assistant reply into slot B for a direct side-by-side view.</div>
+        <div class="status-box" id="compareSummary" style="margin-top:12px">Choose two assistant replies to compare structure, route notes, and length.</div>
+        <div class="action-row" style="margin-top:12px">
+          <button class="ghost" id="swapCompareBtn">Swap A/B</button>
+          <button class="ghost" id="clearCompareBtn">Clear Compare</button>
         </div>
       </section>
 
@@ -350,6 +445,10 @@ HTML = """<!doctype html>
           <textarea id="prompt" placeholder="Type a message, coding question, reasoning task, or image prompt. Press Enter to send, Shift+Enter for a new line."></textarea>
           <div class="chip-row" id="starterChips"></div>
           <div class="focus-row" id="focusChips"></div>
+          <div class="dispatch-box" id="dispatchPreview">
+            <strong>Dispatch Preview</strong>
+            Route planning is loading.
+          </div>
           <div class="composer-meta">
             <div class="composer-stats" id="promptStats"></div>
             <div class="note" id="shortcutNote">Enter sends, Shift+Enter adds a new line.</div>
@@ -389,8 +488,13 @@ HTML = """<!doctype html>
       {key:'compare', label:'Compare', style:'analyst', hint:'Structure the answer as a compact comparison with tradeoffs, risks, and the strongest recommendation.'},
       {key:'creative', label:'Creative', style:'creative', hint:'Keep the answer imaginative but coherent, with vivid detail and a clear final shape.'}
     ];
+    const uiStateKey = 'supermix-studio-ui-state-v4';
+    const briefMarker = '[Session Brief]';
 
     let catalog = [];
+    let modelStoreRows = [];
+    let modelStoreJobs = [];
+    let modelStorePollHandle = 0;
     let selectedModelKey = 'auto';
     let transcript = [];
     let lastGeneratedImagePath = '';
@@ -398,12 +502,457 @@ HTML = """<!doctype html>
     let currentUploadedImageUrl = '';
     let currentUploadedImageName = '';
     let activeFocusKey = '';
+    let sessionBrief = {objective:'', constraints:'', done:''};
+    let savedDrafts = [];
+    let contextBank = [];
+    let threadBookmarks = [];
+    let compareSlots = {a:null, b:null};
+    let messageSerial = 0;
+
+    function readUiState(){
+      try{
+        const raw = localStorage.getItem(uiStateKey);
+        if(!raw) return {};
+        return JSON.parse(raw) || {};
+      }catch(_error){
+        return {};
+      }
+    }
+
+    const bootState = readUiState();
+    sessionBrief = Object.assign({}, sessionBrief, bootState.sessionBrief || {});
+    savedDrafts = Array.isArray(bootState.savedDrafts) ? bootState.savedDrafts.slice(0, 10) : [];
+    contextBank = Array.isArray(bootState.contextBank) ? bootState.contextBank.slice(0, 12) : [];
 
     function escapeHtml(value){
       return String(value || '')
         .replaceAll('&', '&amp;')
         .replaceAll('<', '&lt;')
         .replaceAll('>', '&gt;');
+    }
+
+    function persistUiState(){
+      localStorage.setItem(uiStateKey, JSON.stringify({
+        sessionBrief,
+        savedDrafts: savedDrafts.slice(0, 10),
+        contextBank: contextBank.slice(0, 12),
+      }));
+    }
+
+    function textWordCount(value){
+      const text = String(value || '').trim();
+      return text ? text.split(/\\s+/).length : 0;
+    }
+
+    function summarizeText(value, maxLength){
+      const text = String(value || '').trim().replace(/\\s+/g, ' ');
+      if(!text) return '-';
+      if(text.length <= maxLength) return text;
+      return text.slice(0, Math.max(0, maxLength - 3)).trimEnd() + '...';
+    }
+
+    function currentSessionBrief(){
+      return {
+        objective: (el('sessionObjective')?.value || '').trim(),
+        constraints: (el('sessionConstraints')?.value || '').trim(),
+        done: (el('sessionDone')?.value || '').trim(),
+      };
+    }
+
+    function applySessionBriefInputs(){
+      el('sessionObjective').value = sessionBrief.objective || '';
+      el('sessionConstraints').value = sessionBrief.constraints || '';
+      el('sessionDone').value = sessionBrief.done || '';
+    }
+
+    function buildSessionBriefText(source){
+      const brief = source || currentSessionBrief();
+      const lines = [];
+      if(brief.objective) lines.push('Objective: ' + brief.objective);
+      if(brief.constraints) lines.push('Constraints: ' + brief.constraints.replace(/\\s*\\n+\\s*/g, ' | '));
+      if(brief.done) lines.push('Done: ' + brief.done);
+      return lines.join('\\n');
+    }
+
+    function stripManagedBriefBlock(value){
+      const text = String(value || '');
+      const markerIndex = text.indexOf(briefMarker);
+      return markerIndex === -1 ? text.trim() : text.slice(0, markerIndex).trim();
+    }
+
+    function composeSystemHint(){
+      const base = stripManagedBriefBlock(el('systemHint').value || '');
+      const brief = buildSessionBriefText();
+      return [base, brief ? `${briefMarker}\\n${brief}` : ''].filter(Boolean).join('\\n\\n');
+    }
+
+    function syncSessionBrief(){
+      sessionBrief = currentSessionBrief();
+      persistUiState();
+      renderSessionBrief();
+      updatePromptStats();
+      updateLiveState();
+      updateDispatchPreview();
+    }
+
+    function clearSessionBrief(){
+      sessionBrief = {objective:'', constraints:'', done:''};
+      applySessionBriefInputs();
+      persistUiState();
+      renderSessionBrief();
+      updatePromptStats();
+      updateLiveState();
+      updateDispatchPreview();
+    }
+
+    function renderSessionBrief(){
+      const brief = currentSessionBrief();
+      const parts = [];
+      if(brief.objective) parts.push(`Objective: ${brief.objective}`);
+      if(brief.constraints) parts.push(`Constraints: ${brief.constraints.replace(/\\s*\\n+\\s*/g, ' | ')}`);
+      if(brief.done) parts.push(`Done: ${brief.done}`);
+      el('sessionBriefNote').textContent = parts.length
+        ? parts.join('\\n')
+        : 'Keep a compact working brief here. It can be folded into the next prompt without rewriting it every time.';
+    }
+
+    function applyBriefToHint(){
+      const composed = composeSystemHint();
+      el('systemHint').value = composed;
+      updatePromptStats();
+      updateDispatchPreview();
+      showToast('ok', composed ? 'Session brief folded into system hint.' : 'No brief to apply.');
+    }
+
+    function inferDraftLabel(prompt){
+      const compact = summarizeText(prompt, 42);
+      return compact === '-' ? 'Untitled draft' : compact;
+    }
+
+    function renderSavedDrafts(){
+      const box = el('savedDrafts');
+      box.innerHTML = '';
+      if(!savedDrafts.length){
+        box.textContent = 'No saved drafts yet.';
+        return;
+      }
+      savedDrafts.forEach((draft) => {
+        const item = document.createElement('div');
+        item.className = 'draft-item';
+        item.innerHTML = `
+          <div class="draft-item-top">
+            <div>
+              <div class="draft-item-title">${escapeHtml(draft.label || 'Untitled draft')}</div>
+              <div class="note">${escapeHtml(draft.model_label || draft.model_key || 'current route')}</div>
+            </div>
+            <div class="note">${escapeHtml(draft.created_at || '')}</div>
+          </div>
+          <div class="draft-item-sub">${escapeHtml(summarizeText(draft.prompt, 180))}</div>
+        `;
+        const actions = document.createElement('div');
+        actions.className = 'draft-item-actions';
+        const insertBtn = document.createElement('button');
+        insertBtn.className = 'mini-btn';
+        insertBtn.textContent = 'Insert';
+        insertBtn.onclick = () => {
+          el('prompt').value = draft.prompt || '';
+          if(draft.model_key && findRecord(draft.model_key)){
+            selectedModelKey = draft.model_key;
+            el('modelSelect').value = draft.model_key;
+            updateModelPanel(findRecord(draft.model_key));
+            refreshUploadPanel();
+          }
+          if(draft.style_mode) el('styleMode').value = draft.style_mode;
+          updatePromptStats();
+          updateLiveState();
+          updateDispatchPreview();
+          el('prompt').focus();
+        };
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'mini-btn';
+        deleteBtn.textContent = 'Delete';
+        deleteBtn.onclick = () => {
+          savedDrafts = savedDrafts.filter((itemDraft) => itemDraft.id !== draft.id);
+          persistUiState();
+          renderSavedDrafts();
+          updateDispatchPreview();
+        };
+        actions.appendChild(insertBtn);
+        actions.appendChild(deleteBtn);
+        item.appendChild(actions);
+        box.appendChild(item);
+      });
+    }
+
+    function saveCurrentDraft(){
+      const prompt = (el('prompt').value || '').trim();
+      if(!prompt){
+        showToast('err', 'Write a prompt before saving a draft.');
+        return;
+      }
+      const record = findRecord(el('modelSelect').value) || findRecord(selectedModelKey) || findRecord('auto');
+      const label = (el('draftLabel').value || '').trim() || inferDraftLabel(prompt);
+      const draft = {
+        id: String(Date.now()),
+        label,
+        prompt,
+        model_key: record?.key || selectedModelKey,
+        model_label: record?.label || record?.key || 'Auto',
+        style_mode: el('styleMode').value,
+        created_at: new Date().toLocaleString(),
+      };
+      savedDrafts = [draft, ...savedDrafts.filter((item) => item.prompt !== prompt)].slice(0, 10);
+      persistUiState();
+      renderSavedDrafts();
+      updateDispatchPreview();
+      showToast('ok', `Saved draft: ${label}`);
+    }
+
+    function renderContextBank(){
+      const box = el('contextBankList');
+      box.innerHTML = '';
+      if(!contextBank.length){
+        box.textContent = 'No saved context yet.';
+        return;
+      }
+      contextBank.forEach((entry) => {
+        const item = document.createElement('div');
+        item.className = 'context-item';
+        item.innerHTML = `
+          <div class="context-item-title">${escapeHtml(entry.label || 'Context')}</div>
+          <div class="context-item-sub">${escapeHtml(summarizeText(entry.text, 190))}</div>
+        `;
+        const actions = document.createElement('div');
+        actions.className = 'context-item-actions';
+
+        const insertBtn = document.createElement('button');
+        insertBtn.className = 'mini-btn';
+        insertBtn.textContent = 'Insert';
+        insertBtn.onclick = () => {
+          const current = (el('prompt').value || '').trim();
+          el('prompt').value = [current, entry.text].filter(Boolean).join('\\n\\n');
+          updatePromptStats();
+          el('prompt').focus();
+        };
+
+        const hintBtn = document.createElement('button');
+        hintBtn.className = 'mini-btn';
+        hintBtn.textContent = 'To Hint';
+        hintBtn.onclick = () => {
+          const base = stripManagedBriefBlock(el('systemHint').value || '');
+          el('systemHint').value = [base, entry.text].filter(Boolean).join('\\n\\n');
+          updatePromptStats();
+          updateDispatchPreview();
+        };
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'mini-btn';
+        deleteBtn.textContent = 'Delete';
+        deleteBtn.onclick = () => {
+          contextBank = contextBank.filter((row) => row.id !== entry.id);
+          persistUiState();
+          renderContextBank();
+          updatePromptStats();
+          updateLiveState();
+        };
+
+        actions.appendChild(insertBtn);
+        actions.appendChild(hintBtn);
+        actions.appendChild(deleteBtn);
+        item.appendChild(actions);
+        box.appendChild(item);
+      });
+    }
+
+    function addContextEntry(text, label){
+      const clean = String(text || '').trim();
+      if(!clean) return false;
+      const entry = {
+        id: String(Date.now() + Math.random()),
+        label: label || inferDraftLabel(clean),
+        text: clean,
+      };
+      contextBank = [entry, ...contextBank.filter((item) => item.text !== clean)].slice(0, 12);
+      persistUiState();
+      renderContextBank();
+      updatePromptStats();
+      updateLiveState();
+      updateDispatchPreview();
+      return true;
+    }
+
+    function addManualContext(){
+      const text = (el('contextNoteInput').value || '').trim();
+      if(!text){
+        showToast('err', 'Write a context note first.');
+        return;
+      }
+      if(addContextEntry(text, 'Manual note')){
+        el('contextNoteInput').value = '';
+        showToast('ok', 'Context note saved.');
+      }
+    }
+
+    function captureLastAssistantContext(){
+      const last = [...transcript].reverse().find((item) => item.role === 'assistant' && item.response);
+      if(!last){
+        showToast('err', 'No assistant reply to capture yet.');
+        return;
+      }
+      if(addContextEntry(last.response || '', last.model_label || 'Last reply')){
+        showToast('ok', 'Last reply added to context bank.');
+      }
+    }
+
+    function clearContextBank(){
+      contextBank = [];
+      persistUiState();
+      renderContextBank();
+      updatePromptStats();
+      updateLiveState();
+      updateDispatchPreview();
+      showToast('ok', 'Context bank cleared.');
+    }
+
+    function renderThreadBookmarks(){
+      const box = el('threadBookmarks');
+      box.innerHTML = '';
+      if(!threadBookmarks.length){
+        box.textContent = 'No bookmarks yet.';
+        el('bookmarkNote').textContent = 'Bookmark a message in the thread to jump back to it later.';
+        return;
+      }
+      threadBookmarks.forEach((entry) => {
+        const item = document.createElement('div');
+        item.className = 'bookmark-item';
+        item.innerHTML = `
+          <div class="bookmark-item-title">${escapeHtml(entry.label || 'Bookmark')}</div>
+          <div class="bookmark-item-sub">${escapeHtml(summarizeText(entry.snippet, 150))}</div>
+        `;
+        const actions = document.createElement('div');
+        actions.className = 'bookmark-item-actions';
+
+        const jumpBtn = document.createElement('button');
+        jumpBtn.className = 'mini-btn';
+        jumpBtn.textContent = 'Jump';
+        jumpBtn.onclick = () => {
+          const node = document.getElementById(entry.message_id);
+          if(node){
+            node.scrollIntoView({behavior:'smooth', block:'center'});
+            node.classList.remove('dim');
+          }
+        };
+
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'mini-btn';
+        removeBtn.textContent = 'Remove';
+        removeBtn.onclick = () => {
+          threadBookmarks = threadBookmarks.filter((itemRow) => itemRow.id !== entry.id);
+          renderThreadBookmarks();
+          const node = document.getElementById(entry.message_id);
+          if(node){
+            node.classList.remove('bookmarked');
+          }
+        };
+
+        actions.appendChild(jumpBtn);
+        actions.appendChild(removeBtn);
+        item.appendChild(actions);
+        box.appendChild(item);
+      });
+      el('bookmarkNote').textContent = `${threadBookmarks.length} bookmark${threadBookmarks.length === 1 ? '' : 's'} in this thread.`;
+    }
+
+    function addThreadBookmark(card){
+      if(!card) return;
+      const messageId = card.dataset.messageId || '';
+      const snippet = card.dataset.messageText || '';
+      if(!messageId || !snippet){
+        showToast('err', 'Nothing bookmarkable on this message.');
+        return;
+      }
+      const label = card.dataset.messageLabel || card.dataset.messageRole || 'Message';
+      const entry = {
+        id: String(Date.now() + Math.random()),
+        message_id: messageId,
+        label,
+        snippet,
+      };
+      threadBookmarks = [entry, ...threadBookmarks.filter((item) => item.message_id !== messageId)].slice(0, 14);
+      card.classList.add('bookmarked');
+      renderThreadBookmarks();
+      showToast('ok', 'Thread bookmark saved.');
+    }
+
+    function renderCompareSlot(nodeId, slotLabel, payload){
+      const node = el(nodeId);
+      if(!payload){
+        node.className = 'compare-slot empty';
+        node.textContent = `Pin an assistant reply into slot ${slotLabel} to compare models, tone, or route decisions.`;
+        return;
+      }
+      node.className = 'compare-slot';
+      node.innerHTML = `
+        <div class="slot-head">
+          <div class="slot-label">Slot ${slotLabel}</div>
+          <div class="slot-meta">${escapeHtml(payload.model_label || 'Assistant')} | ${payload.word_count} words</div>
+        </div>
+        <div class="slot-body">${escapeHtml(summarizeText(payload.response, 200))}</div>
+        <div class="note">${escapeHtml(payload.route_reason || 'No route note saved for this reply.')}</div>
+      `;
+    }
+
+    function renderCompareBench(){
+      renderCompareSlot('compareSlotA', 'A', compareSlots.a);
+      renderCompareSlot('compareSlotB', 'B', compareSlots.b);
+      const a = compareSlots.a;
+      const b = compareSlots.b;
+      if(!a || !b){
+        el('compareSummary').textContent = 'Choose two assistant replies to compare structure, route notes, and length.';
+        return;
+      }
+      const wordDelta = Math.abs((a.word_count || 0) - (b.word_count || 0));
+      const longer = (a.word_count || 0) === (b.word_count || 0)
+        ? 'same length'
+        : ((a.word_count || 0) > (b.word_count || 0) ? `A longer by ${wordDelta} words` : `B longer by ${wordDelta} words`);
+      const modelDelta = a.model_label === b.model_label ? 'same model family' : `${a.model_label} vs ${b.model_label}`;
+      const routeDelta = a.route_reason && b.route_reason
+        ? (a.route_reason === b.route_reason ? 'same route note' : 'different route notes')
+        : 'one or both route notes missing';
+      el('compareSummary').textContent = [
+        `Models: ${modelDelta}`,
+        `Length: ${longer}`,
+        `Routing: ${routeDelta}`,
+        `A preview: ${summarizeText(a.response, 140)}`,
+        `B preview: ${summarizeText(b.response, 140)}`,
+      ].join('\\n\\n');
+    }
+
+    function snapshotAssistantReply(payload){
+      return {
+        model_label: payload.model_label || 'Assistant',
+        response: payload.response || '',
+        route_reason: payload.route_reason || '',
+        word_count: textWordCount(payload.response || ''),
+      };
+    }
+
+    function updateDispatchPreview(){
+      const record = findRecord(el('modelSelect').value || selectedModelKey) || findRecord(selectedModelKey) || findRecord('auto');
+      const prompt = (el('prompt').value || '').trim();
+      const lines = [];
+      lines.push(`Route: ${record?.key === 'auto' ? 'Auto chooser' : (record?.label || record?.key || 'Auto')}`);
+      lines.push(`Mode: ${el('actionMode').value} | Agent: ${el('agentMode').value} | Style: ${el('styleMode').value}`);
+      lines.push(`Payload: ${textWordCount(prompt)} words${currentUploadedImagePath ? ' | image attached' : ''}${activeFocusKey ? ` | focus ${activeFocusKey}` : ''}`);
+      const brief = buildSessionBriefText();
+      if(brief) lines.push(`Brief: ${brief.replace(/\\n+/g, ' | ')}`);
+      if(contextBank.length){
+        const preview = contextBank.slice(0, 3).map((item) => item.label || inferDraftLabel(item.text)).join(', ');
+        lines.push(`Context bank: ${contextBank.length} saved${preview ? ` | ${preview}` : ''}`);
+      }
+      const hint = stripManagedBriefBlock(el('systemHint').value || '');
+      if(hint) lines.push(`Hint: ${summarizeText(hint, 170)}`);
+      el('dispatchPreview').innerHTML = `<strong>Dispatch Preview</strong>${escapeHtml(lines.join('\\n')).replaceAll('\\n', '<br>')}`;
     }
 
     function showToast(kind, message){
@@ -559,6 +1108,115 @@ HTML = """<!doctype html>
       el('discoveryNote').textContent = parts.join(' | ');
     }
 
+    function latestStoreJob(fileName){
+      return (modelStoreJobs || []).find((job) => job.file_name === fileName) || null;
+    }
+
+    function renderModelStore(){
+      const box = el('modelStoreList');
+      box.innerHTML = '';
+      if(!modelStoreRows.length){
+        box.textContent = 'No remote store entries loaded yet.';
+        return;
+      }
+      const activeJobs = (modelStoreJobs || []).filter((job) => ['queued', 'downloading'].includes(job.status || '')).length;
+      el('modelStoreNote').textContent = activeJobs
+        ? `${activeJobs} install job${activeJobs === 1 ? '' : 's'} running. Installed files refresh the local catalog automatically.`
+        : 'Browse every published Supermix artifact from Hugging Face and install it into the local model directory.';
+      modelStoreRows.forEach((row) => {
+        const item = document.createElement('div');
+        item.className = 'draft-item';
+        const job = latestStoreJob(row.file_name);
+        const jobStatus = job ? String(job.status || '') : '';
+        const progress = job && Number(job.total_bytes || 0) > 0
+          ? `${Math.min(100, Math.round((Number(job.downloaded_bytes || 0) / Number(job.total_bytes || 1)) * 100))}%`
+          : '';
+        const statusText = row.installed
+          ? (row.selectable ? 'Installed and selectable' : 'Downloaded locally')
+          : (jobStatus ? `${jobStatus}${progress ? ` ${progress}` : ''}` : 'Remote only');
+        item.innerHTML = `
+          <div class="draft-item-top">
+            <div>
+              <div class="draft-item-title">${escapeHtml(row.label || row.file_name)}</div>
+              <div class="note">${escapeHtml(row.file_name)}</div>
+            </div>
+            <div class="note">${escapeHtml(bytesToText(row.size_bytes || 0))}</div>
+          </div>
+          <div class="draft-item-sub">${escapeHtml([
+            row.family || 'other',
+            row.known ? ((row.capabilities || []).join(', ') || row.kind || 'known artifact') : 'download-only artifact',
+            statusText
+          ].filter(Boolean).join(' | '))}</div>
+        `;
+        if(row.note){
+          const note = document.createElement('div');
+          note.className = 'note';
+          note.textContent = row.note;
+          item.appendChild(note);
+        }
+        if(job && job.error){
+          const err = document.createElement('div');
+          err.className = 'note';
+          err.textContent = 'Install error: ' + job.error;
+          item.appendChild(err);
+        }
+        const actions = document.createElement('div');
+        actions.className = 'draft-item-actions';
+        const openBtn = document.createElement('a');
+        openBtn.className = 'mini-btn';
+        openBtn.href = row.download_url || '#';
+        openBtn.target = '_blank';
+        openBtn.rel = 'noreferrer';
+        openBtn.textContent = 'Open Remote';
+        actions.appendChild(openBtn);
+
+        const installBtn = document.createElement('button');
+        installBtn.className = 'mini-btn';
+        installBtn.textContent = row.installed ? 'Installed' : (jobStatus === 'downloading' ? 'Downloading...' : 'Install');
+        installBtn.disabled = Boolean(row.installed || ['queued', 'downloading'].includes(jobStatus));
+        installBtn.onclick = () => installStoreModel(row.file_name);
+        actions.appendChild(installBtn);
+        item.appendChild(actions);
+        box.appendChild(item);
+      });
+    }
+
+    async function refreshModelStore(force=false){
+      const suffix = force ? '?refresh=1' : '';
+      try{
+        const [storeResp, jobsResp] = await Promise.all([
+          jget('/api/model_store' + suffix),
+          jget('/api/model_store/jobs')
+        ]);
+        modelStoreRows = storeResp.models || [];
+        modelStoreJobs = jobsResp.jobs || [];
+        renderModelStore();
+        if(modelStorePollHandle){
+          clearTimeout(modelStorePollHandle);
+          modelStorePollHandle = 0;
+        }
+        if((modelStoreJobs || []).some((job) => ['queued', 'downloading'].includes(job.status || ''))){
+          modelStorePollHandle = setTimeout(() => refreshModelStore(false), 3000);
+        }
+      }catch(error){
+        el('modelStoreNote').textContent = 'Model store error: ' + error.message;
+        el('modelStoreList').textContent = 'Unable to reach the remote model store right now.';
+      }
+    }
+
+    async function installStoreModel(fileName){
+      try{
+        const data = await jpost('/api/model_store/install', {file_name: fileName});
+        showToast('ok', `Install started for ${fileName}.`);
+        modelStoreJobs = [data.job || {}, ...(modelStoreJobs || []).filter((job) => job.job_id !== data.job?.job_id)];
+        renderModelStore();
+        refreshModelStore(false);
+        refresh();
+      }catch(error){
+        showToast('err', error.message);
+      }
+    }
+
     function renderCapabilities(record){
       const box = el('capabilities');
       box.innerHTML = '';
@@ -640,13 +1298,17 @@ HTML = """<!doctype html>
       const text = el('prompt').value || '';
       const words = text.trim() ? text.trim().split(/\\s+/).length : 0;
       const chars = text.length;
+      const brief = buildSessionBriefText();
       const bits = [
         `${words} words`,
         `${chars} chars`,
         currentUploadedImagePath ? 'image attached' : 'no image',
-        activeFocusKey ? `focus: ${activeFocusKey}` : 'focus: standard'
+        activeFocusKey ? `focus: ${activeFocusKey}` : 'focus: standard',
+        brief ? 'brief active' : 'brief off',
+        contextBank.length ? `context ${contextBank.length}` : 'context off'
       ];
       el('promptStats').innerHTML = bits.map((bit) => `<div class="composer-stat">${escapeHtml(bit)}</div>`).join('');
+      updateDispatchPreview();
     }
 
     function updateLiveState(status){
@@ -656,9 +1318,12 @@ HTML = """<!doctype html>
       chips.push(el('agentMode').value === 'collective' ? 'collective panel' : 'single reply');
       chips.push(el('memoryMode').value === 'on' ? 'memory on' : 'memory off');
       chips.push(el('webSearchMode').value === 'on' ? 'web tool on' : 'web tool off');
+      if(buildSessionBriefText()) chips.push('brief armed');
+      if(contextBank.length) chips.push(`context ${contextBank.length}`);
       if(currentUploadedImagePath) chips.push('image attached');
       el('liveStateChips').innerHTML = chips.map((bit, idx) => `<div class="meta-pill ${idx === 0 ? 'accent' : ''}">${escapeHtml(bit)}</div>`).join('');
       el('liveStateNote').textContent = status?.last_route_reason || 'Use focus packs to bias how the assistant approaches the next prompt.';
+      updateDispatchPreview();
     }
 
     function applyThreadFilter(){
@@ -732,13 +1397,13 @@ HTML = """<!doctype html>
           model.val_rows != null ? `${model.val_rows} val` : ''
         ].filter(Boolean).join(' | ');
         const concepts = (model.concept_labels || []).slice(0, 10).join(', ');
-        el('threeDViewerNote').textContent = [counts, concepts ? `Concepts: ${concepts}` : ''].filter(Boolean).join('\n');
+        el('threeDViewerNote').textContent = [counts, concepts ? `Concepts: ${concepts}` : ''].filter(Boolean).join('\\n');
         const samples = (model.sample_predictions || []).map((item) => {
           const confidence = item.confidence != null ? ` (${formatMetric(item.confidence)})` : '';
-          return `${item.predicted_label || item.predicted_concept || 'prediction'}${confidence}\nPrompt: ${item.prompt || ''}`;
+          return `${item.predicted_label || item.predicted_concept || 'prediction'}${confidence}\\nPrompt: ${item.prompt || ''}`;
         });
         el('threeDViewerSummary').textContent = samples.length
-          ? samples.join('\n\n')
+          ? samples.join('\\n\\n')
           : 'No sample predictions were packaged with this model.';
         setThreeDDownloadLink('threeDZipLink', model.download_zip_url || '', 'Download Model ZIP');
         setThreeDDownloadLink('threeDSummaryLink', model.download_summary_url || '', 'Download Summary JSON');
@@ -774,6 +1439,14 @@ HTML = """<!doctype html>
     function addMessage(kind, payload){
       const card = document.createElement('div');
       card.className = 'msg ' + kind;
+      const messageId = 'msg-' + (++messageSerial);
+      const messageText = payload.response || payload.prompt_used || '';
+      const messageLabel = payload.model_label || (kind === 'user' ? 'You' : 'Assistant');
+      card.id = messageId;
+      card.dataset.messageId = messageId;
+      card.dataset.messageRole = kind;
+      card.dataset.messageLabel = messageLabel;
+      card.dataset.messageText = messageText;
       const metaBadges = [];
       if(payload.model_label) metaBadges.push(`<span class="meta-pill">${escapeHtml(payload.model_label)}</span>`);
       if(payload.kind === 'image') metaBadges.push('<span class="meta-pill">image</span>');
@@ -816,8 +1489,14 @@ HTML = """<!doctype html>
       if(payload.response){
         actions.innerHTML += `<button class="mini-btn copy-text-btn" data-copy-text="${escapeHtml(payload.response || '')}">Copy Text</button>`;
       }
+      if(messageText && payload.kind !== 'image'){
+        actions.innerHTML += `<button class="mini-btn pin-context-btn">Pin Context</button>`;
+        actions.innerHTML += `<button class="mini-btn bookmark-msg-btn">Bookmark</button>`;
+      }
       if(kind === 'assistant' && payload.response){
         actions.innerHTML += `<button class="mini-btn reuse-msg-btn" data-reuse-text="${escapeHtml(payload.response || '')}">Reuse In Prompt</button>`;
+        actions.innerHTML += `<button class="mini-btn compare-a-btn">Pin A</button>`;
+        actions.innerHTML += `<button class="mini-btn compare-b-btn">Pin B</button>`;
       }
       if(payload.route_reason){
         const route = document.createElement('div');
@@ -860,6 +1539,9 @@ HTML = """<!doctype html>
         payload.route_reason || '',
         payload.uploaded_image_name || ''
       ].join(' ');
+      if(kind === 'assistant' && payload.response){
+        card.dataset.comparePayload = JSON.stringify(snapshotAssistantReply(payload));
+      }
       thread.appendChild(card);
       jumpToLatest();
       transcript.push(buildTranscriptEntry(kind, payload));
@@ -916,12 +1598,16 @@ HTML = """<!doctype html>
         await jpost('/api/clear', {session_id: sessionId});
         thread.innerHTML = '';
         transcript = [];
+        threadBookmarks = [];
+        compareSlots = {a:null, b:null};
         lastGeneratedImagePath = '';
         clearUploadedImage();
         const welcome = document.createElement('div');
         welcome.className = 'welcome';
         welcome.textContent = 'Session cleared.';
         thread.appendChild(welcome);
+        renderThreadBookmarks();
+        renderCompareBench();
         summarizeTranscript();
         updatePromptStats();
       }catch(error){
@@ -992,7 +1678,7 @@ HTML = """<!doctype html>
           web_search_enabled: el('webSearchMode').value === 'on',
           uploaded_image_path: currentUploadedImagePath,
           style_mode: el('styleMode').value,
-          system_hint: el('systemHint').value,
+          system_hint: composeSystemHint(),
           image_style: el('imageStyle').value,
           image_width: Number(el('imageWidth').value || 512),
           image_height: Number(el('imageHeight').value || 512),
@@ -1109,6 +1795,10 @@ HTML = """<!doctype html>
     el('clearUploadBtn').onclick = clearUploadedImage;
     el('saveChatImageBtn').onclick = exportChatImage;
     el('saveLastImageBtn').onclick = saveLastImage;
+    el('addContextNoteBtn').onclick = addManualContext;
+    el('captureLastReplyBtn').onclick = captureLastAssistantContext;
+    el('clearContextBankBtn').onclick = clearContextBank;
+    el('refreshStoreBtn').onclick = () => refreshModelStore(true);
     el('modelSearch').addEventListener('input', renderCatalog);
     el('capabilityFilter').addEventListener('change', renderCatalog);
     el('modelSelect').addEventListener('change', () => {
@@ -1123,6 +1813,9 @@ HTML = """<!doctype html>
     el('webSearchMode').addEventListener('change', updateLiveState);
     el('styleMode').addEventListener('change', updatePromptStats);
     el('systemHint').addEventListener('input', updatePromptStats);
+    el('sessionObjective').addEventListener('input', syncSessionBrief);
+    el('sessionConstraints').addEventListener('input', syncSessionBrief);
+    el('sessionDone').addEventListener('input', syncSessionBrief);
     el('threadFilter').addEventListener('input', applyThreadFilter);
     thread.addEventListener('click', (event) => {
       const button = event.target.closest('.save-image-btn');
@@ -1140,6 +1833,37 @@ HTML = """<!doctype html>
         el('prompt').value = reuseButton.dataset.reuseText || '';
         el('prompt').focus();
         updatePromptStats();
+        return;
+      }
+      const pinContextButton = event.target.closest('.pin-context-btn');
+      if(pinContextButton){
+        const card = pinContextButton.closest('.msg');
+        if(addContextEntry(card?.dataset.messageText || '', card?.dataset.messageLabel || 'Pinned message')){
+          showToast('ok', 'Message added to context bank.');
+        }else{
+          showToast('err', 'Nothing to add from this message.');
+        }
+        return;
+      }
+      const bookmarkButton = event.target.closest('.bookmark-msg-btn');
+      if(bookmarkButton){
+        addThreadBookmark(bookmarkButton.closest('.msg'));
+        return;
+      }
+      const compareAButton = event.target.closest('.compare-a-btn');
+      if(compareAButton){
+        const card = compareAButton.closest('.msg');
+        compareSlots.a = JSON.parse(card?.dataset.comparePayload || 'null');
+        renderCompareBench();
+        showToast('ok', 'Reply pinned to slot A.');
+        return;
+      }
+      const compareBButton = event.target.closest('.compare-b-btn');
+      if(compareBButton){
+        const card = compareBButton.closest('.msg');
+        compareSlots.b = JSON.parse(card?.dataset.comparePayload || 'null');
+        renderCompareBench();
+        showToast('ok', 'Reply pinned to slot B.');
       }
     });
     el('prompt').addEventListener('keydown', (event) => {
@@ -1149,6 +1873,21 @@ HTML = """<!doctype html>
       }
     });
     el('prompt').addEventListener('input', updatePromptStats);
+    el('applyBriefBtn').onclick = applyBriefToHint;
+    el('clearBriefBtn').onclick = () => {
+      clearSessionBrief();
+      showToast('ok', 'Session brief cleared.');
+    };
+    el('saveDraftBtn').onclick = saveCurrentDraft;
+    el('insertLatestDraftBtn').onclick = () => {
+      if(!savedDrafts.length){
+        showToast('err', 'No saved drafts yet.');
+        return;
+      }
+      el('prompt').value = savedDrafts[0].prompt || '';
+      updatePromptStats();
+      el('prompt').focus();
+    };
     el('copyLastBtn').onclick = () => {
       const last = [...transcript].reverse().find((item) => item.role === 'assistant' && item.response);
       if(!last){
@@ -1173,12 +1912,29 @@ HTML = """<!doctype html>
       showToast('ok', 'Thread JSON downloaded.');
     };
     el('jumpBottomBtn').onclick = jumpToLatest;
+    el('swapCompareBtn').onclick = () => {
+      const temp = compareSlots.a;
+      compareSlots.a = compareSlots.b;
+      compareSlots.b = temp;
+      renderCompareBench();
+    };
+    el('clearCompareBtn').onclick = () => {
+      compareSlots = {a:null, b:null};
+      renderCompareBench();
+    };
 
     buildStarterChips();
+    applySessionBriefInputs();
+    renderSessionBrief();
+    renderSavedDrafts();
+    renderContextBank();
+    renderThreadBookmarks();
+    renderCompareBench();
     renderFocusChips();
     summarizeTranscript();
     updatePromptStats();
     updateLiveState();
+    refreshModelStore(true);
     refresh();
   </script>
 </body>
@@ -1196,6 +1952,28 @@ def build_app(manager: UnifiedModelManager) -> Flask:
     @app.get("/api/catalog")
     def api_catalog():
         return jsonify({"ok": True, "models": models_to_json(manager.records)})
+
+    @app.get("/api/model_store")
+    def api_model_store():
+        force_refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
+        payload = manager.model_store_catalog(force_refresh=force_refresh)
+        return jsonify({"ok": True, **payload})
+
+    @app.get("/api/model_store/jobs")
+    def api_model_store_jobs():
+        return jsonify({"ok": True, **manager.model_store_jobs()})
+
+    @app.post("/api/model_store/install")
+    def api_model_store_install():
+        payload = request.get_json(force=True, silent=True) or {}
+        file_name = str(payload.get("file_name") or "").strip()
+        if not file_name:
+            return jsonify({"ok": False, "error": "file_name is required"}), 400
+        try:
+            job = manager.install_model_store_artifact(file_name)
+            return jsonify({"ok": True, "job": job})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
 
     @app.get("/api/status")
     def api_status():
@@ -1368,6 +2146,8 @@ def main() -> None:
         extraction_root=extraction_root,
         generated_dir=generated_dir,
         device_preference=str(args.device_preference),
+        models_dir=models_dir,
+        common_summary_path=common_summary if common_summary is not None else DEFAULT_COMMON_SUMMARY,
     )
     app = build_app(manager)
     print(f"Supermix Studio: http://{args.host}:{args.port}")

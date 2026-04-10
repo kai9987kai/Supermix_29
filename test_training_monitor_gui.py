@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -8,12 +9,15 @@ sys.path.append(os.path.join(os.getcwd(), "source"))
 
 from training_monitor_gui import (
     RunSnapshot,
+    collect_run_snapshots,
     _build_run_recommendation,
     _build_recovery_outlook,
     _build_run_rescue_plan,
+    _build_run_stability_lab,
     _build_run_watch_summary,
     _build_runtime_headline,
     _build_selected_vs_fleet_summary,
+    _failure_lens,
     _build_health_summary,
     _build_launch_command,
     _compute_display_progress_percent,
@@ -30,6 +34,7 @@ from training_monitor_gui import (
     _summarize_fleet_tempo,
     _summarize_fleet_spotlight,
     _summarize_fleet_watchlist,
+    _summarize_fleet_research_radar,
     _summarize_research_results,
     _summarize_issue_runs,
     _summarize_stage_mix,
@@ -305,6 +310,78 @@ def test_monitor_focus_and_issue_summaries():
     assert fleet_watch.startswith("Fleet Watch:")
     assert "run_error" in fleet_watch
     assert "run_stalled" in fleet_watch
+
+
+def test_omni_state_sidecar_is_discovered_and_applied():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output_dir = root / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_log = output_dir / "omni_collective_v41_train_20260409_120000.out.log"
+        out_log.write_text('{"event":"stage_start","stage":"stage2"}\n', encoding="utf-8")
+        (output_dir / "omni_collective_v41_train.worker.pid").write_text(str(os.getpid()), encoding="utf-8")
+        state_payload = {
+            "status": "stage_running",
+            "stage": "stage2",
+            "batch_index": 3892,
+            "total_batches": 7545,
+            "avg_train_loss": 10.7124,
+            "lr": 5.39e-05,
+            "eta_seconds": 21631.297,
+            "elapsed_seconds": 23046.539,
+            "avg_balance_loss": 0.174046,
+        }
+        (output_dir / "omni_collective_v41_train_state.json").write_text(
+            json.dumps(state_payload),
+            encoding="utf-8",
+        )
+
+        rows = collect_run_snapshots(root, stale_minutes_threshold=20.0)
+
+    snap = next(row for row in rows if row.run_name == "omni_collective_v41_train_20260409_120000")
+    assert snap.pid_alive is True
+    assert snap.stage == "stage2"
+    assert snap.stage_source == "state"
+    assert snap.state_file is not None and snap.state_file.name == "omni_collective_v41_train_state.json"
+    assert snap.stage_progress_label == "3892/7545 batches"
+    assert snap.stage_progress_percent is not None and 51.0 < snap.stage_progress_percent < 52.0
+    assert snap.stage_eta_seconds is not None and snap.stage_eta_seconds > 20000
+    assert snap.balance_loss is not None and abs(snap.balance_loss - 0.174046) < 1e-9
+    display_pct = _compute_display_progress_percent(snap)
+    assert display_pct is not None and 75.0 < display_pct < 80.0
+
+
+def test_stability_lab_failure_lens_and_research_radar():
+    snap = _make_snapshot(
+        run_name="omni_collective_v41_train_20260409_120000",
+        stage="stage2",
+        status="running",
+        err_signal="warn",
+        err_summary="PytorchStreamWriter failed writing file",
+        tail_lines=["trace ok"],
+        err_tail_lines=["OSError: [Errno 28] No space left on device"],
+        balance_loss=0.281,
+        stage_source="state",
+    )
+    now = time.time()
+    loss_history = [(now - 900 + i * 60, value) for i, value in enumerate([8.0, 8.1, 8.0, 8.2, 8.1, 9.0, 9.2, 9.4, 9.5])]
+    rate_history = [(now - 900 + i * 60, value) for i, value in enumerate([120.0, 122.0, 121.0, 119.0, 118.0, 84.0, 80.0, 79.0, 78.0])]
+    cpu_history = [(now - 900 + i * 60, value) for i, value in enumerate([40.0, 42.0, 43.0, 44.0, 45.0, 68.0, 72.0, 74.0, 76.0])]
+
+    lab = _build_run_stability_lab(snap, loss_history, rate_history, cpu_history)
+    assert lab.startswith("Stability Lab:")
+    assert "loss drift" in lab
+    assert "throughput down" in lab
+    assert "routing balance pressure" in lab
+
+    lens = _failure_lens(snap)
+    assert lens == "Failure Lens: storage or checkpoint-write risk"
+
+    radar = _summarize_fleet_research_radar([snap], {snap.run_name: loss_history}, {snap.run_name: rate_history})
+    assert radar.startswith("Research Radar:")
+    assert "1 loss-drift" in radar
+    assert "1 throughput-drift" in radar
+    assert "1 balance-alert" in radar
 
 
 def test_run_watch_summary_and_runtime_headline():

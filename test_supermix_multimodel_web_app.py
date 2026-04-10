@@ -176,9 +176,22 @@ def test_index_contains_discovery_ui():
         assert 'id="composeQuickBtn"' in html
         assert 'id="composeMediaBtn"' in html
         assert 'id="composeWorkbenchBtn"' in html
+        assert 'id="loopBudget"' in html
+        assert '<option value="loop">Loop Agent</option>' in html
+        assert '<option value="collective_loop">Collective + Loop</option>' in html
         assert 'id="toggleSidebarBtn"' in html
         assert 'id="toggleThreadDensityBtn"' in html
         assert 'id="responseDeck"' in html
+        assert 'id="deliverableTarget"' in html
+        assert 'id="successChecks"' in html
+        assert 'id="riskBox"' in html
+        assert 'id="confidenceMode"' in html
+        assert 'id="evidenceMode"' in html
+        assert 'id="clarifyMode"' in html
+        assert 'id="assumptionMode"' in html
+        assert 'id="refinementDeck"' in html
+        assert 'id="refineLastReplyBtn"' in html
+        assert 'id="challengeLastReplyBtn"' in html
 
 
 def test_model_store_endpoints():

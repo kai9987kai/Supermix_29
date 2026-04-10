@@ -45,6 +45,13 @@ New `v41` heads:
 - `uncertainty_anchor_head`
   Reward transparent uncertainty and missing-evidence statements instead of invented specifics.
 
+Two more explicit `v41` ideas should now be treated as first-class:
+
+- `reflection memory shards`
+  Keep compact bad-attempt -> reflection -> repaired-answer traces for coding and reasoning tasks.
+- `reasoning budget labels`
+  Supervise when a task deserves a short, medium, or deep solve instead of globally increasing thinking depth.
+
 ## New Training Ideas
 
 These are the main `v41` innovations, grounded in recent work but adapted to the Supermix local-first setup:
@@ -70,6 +77,12 @@ These are the main `v41` innovations, grounded in recent work but adapted to the
 7. `Route-Then-Answer Supervision`
    Train on hidden or explicit route-selection labels before the final answer. This should improve Auto mode, collective mode, and specialist handoff decisions.
 
+8. `Reflection Memory`
+   Keep concise post-mortems for failed code, route, and reasoning attempts, then train on the repaired response.
+
+9. `Reasoning Budget Curriculum`
+   Train the same task under short, medium, and deep answer budgets so the model learns when extra deliberation is actually worth it.
+
 ## Data Mix Changes
 
 The data should become denser and more varied, not just larger:
@@ -78,6 +91,8 @@ The data should become denser and more varied, not just larger:
   A compact, hard reasoning set with fewer repetitive examples and higher per-row value.
 - `code_critique_repair`
   Traceback, failing-test, patch, and critique loops for coding and debugging.
+- `reflection_memory_rows`
+  Failure -> short reflection -> improved retry traces.
 - `human_communication_polish`
   Rewrites, comparisons, explanations, de-escalation, uncertainty framing, and direct-but-clear human answers.
 - `teacher_disagreement_hardcases`
@@ -88,6 +103,8 @@ The data should become denser and more varied, not just larger:
   Creativity with fidelity, style control, and factual discipline.
 - `route_then_answer_supervision`
   Tool/model choice before answer.
+- `reasoning_budget_curriculum`
+  Same task solved under short, medium, and deep answer budgets.
 - `specialist_dense_topups`
   Materials, protein, 3D, vision, and native-image deltas that keep the omni stack broad.
 
@@ -109,6 +126,9 @@ Recommended `v41` phases:
 
 5. `Stage 4: communication polish`
    Finish with human-facing clarity, compare/explain prompts, and grounded uncertainty.
+
+6. `Stage 5: self-correction finish`
+   Run deterministic self-correction on weak drafts with fair prompts and keep only improved outputs.
 
 ## Runtime and Reliability Defaults
 
@@ -136,16 +156,26 @@ Minimum goals:
 - must beat `omni_collective_v8_preview` and `omni_collective_v7`
 - stretch goal: approach or beat `v40_benchmax` on benchmark-heavy reasoning while remaining better on specialist and conversational tasks
 
+Promotion protocol:
+
+- benchmark at least `3` preview checkpoints during stage 2
+- do not promote a final model that regresses vision or domain accuracy by more than `0.02` vs `v8`
+- require a clean win on the new communication, code-repair, and grounded-uncertainty eval packs before promotion
+
 ## Primary-Source Inspirations
 
 These papers are being used as inspirations, not copied recipes:
 
 - DeepSeek-V3 Technical Report: https://arxiv.org/abs/2412.19437
+- Better & Faster Large Language Models via Multi-token Prediction: https://arxiv.org/abs/2404.19737
 - s1: Simple test-time scaling: https://arxiv.org/abs/2501.19393
 - LIMO: Less Is More for Reasoning: https://arxiv.org/abs/2502.03387
 - RefineCoder: https://arxiv.org/abs/2502.09183
+- Reflexion: https://arxiv.org/abs/2303.11366
 - Self-Play Fine-Tuning (SPIN): https://arxiv.org/abs/2401.01335
 - Self-Refine: https://arxiv.org/abs/2303.17651
+- Large Language Models have Intrinsic Self-Correction Ability: https://arxiv.org/abs/2406.15673
+- RLAIF: https://arxiv.org/abs/2309.00267
 
 ## Immediate Next Steps
 

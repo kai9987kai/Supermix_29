@@ -60,6 +60,7 @@ from omni_collective_v5_model import OmniCollectiveEngineV5
 from omni_collective_v6_model import OmniCollectiveEngineV6
 from omni_collective_v7_model import OmniCollectiveEngineV7
 from omni_collective_v8_model import OmniCollectiveEngineV8
+from omni_collective_v42_model import OmniCollectiveEngineV42
 from omni_collective_v41_model import OmniCollectiveEngineV41
 from run import safe_load_state_dict
 
@@ -1083,6 +1084,49 @@ class OmniCollectiveV41Backend(BaseBackend):
         )
 
 
+class OmniCollectiveV42Backend(BaseBackend):
+    def __init__(self, record: ModelRecord, extracted_dir: Path, generated_dir: Path) -> None:
+        super().__init__(record, extracted_dir, generated_dir)
+        weights_path = _find_matching_file(extracted_dir, record.preferred_weights, ".pth")
+        meta_path = _find_matching_file(extracted_dir, record.preferred_meta, ".json")
+        if weights_path is None or meta_path is None:
+            raise FileNotFoundError(f"Missing omnibus weights/meta for {record.label} in {extracted_dir}")
+        self.weights_path = weights_path.resolve()
+        self.meta_path = meta_path.resolve()
+        self.engine = OmniCollectiveEngineV42(weights_path=self.weights_path, meta_path=self.meta_path)
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "backend": "omni_collective_v42",
+            "record": self.record.to_dict(),
+            "weights_path": str(self.weights_path),
+            "meta_path": str(self.meta_path),
+            "runtime": {
+                "device": str(self.engine.device),
+                "image_size": int(self.engine.image_size),
+                "vocab_size": len(self.engine.vocab),
+                "response_count": len(self.engine.responses),
+                "deliberation_passes": int(self.engine.deliberation_passes),
+                "minimum_passes": int(self.engine.minimum_passes),
+                "grounding_threshold": float(self.engine.grounding_threshold),
+            },
+        }
+
+    def chat(self, session_id: str, prompt: str, settings: Dict[str, Any]) -> ChatResult:
+        image_path = str(settings.get("uploaded_image_path") or "").strip()
+        effective_prompt = _compose_text_prompt(prompt, settings)
+        response = self.engine.answer(effective_prompt, image_path=image_path or None)
+        return ChatResult(
+            kind="text",
+            model_key=self.record.key,
+            model_label=self.record.label,
+            route_reason=str(settings.get("route_reason") or ""),
+            response=response,
+            timing={},
+            prompt_used=effective_prompt,
+        )
+
+
 class UnifiedModelManager:
     def __init__(
         self,
@@ -1165,6 +1209,8 @@ class UnifiedModelManager:
             return OmniCollectiveV7Backend(record, extracted_dir, self.generated_dir)
         if record.kind == "omni_collective_v8":
             return OmniCollectiveV8Backend(record, extracted_dir, self.generated_dir)
+        if record.kind == "omni_collective_v42":
+            return OmniCollectiveV42Backend(record, extracted_dir, self.generated_dir)
         if record.kind == "omni_collective_v41":
             return OmniCollectiveV41Backend(record, extracted_dir, self.generated_dir)
         if record.kind == "qwen_adapter":
@@ -1405,7 +1451,7 @@ class UnifiedModelManager:
         return f"{session_id}::{purpose}::{record_key}"
 
     def _default_text_record(self) -> ModelRecord:
-        for key in ("omni_collective_v41", "v40_benchmax", "omni_collective_v8", "omni_collective_v7", "omni_collective_v6", "omni_collective_v5", "omni_collective_v4", "omni_collective_v3", "v33_final", "omni_collective_v2", "v35_final", "v34_final", "qwen_v28", "v31_final", "v30_lite"):
+        for key in ("omni_collective_v42", "omni_collective_v41", "v40_benchmax", "omni_collective_v8", "omni_collective_v7", "omni_collective_v6", "omni_collective_v5", "omni_collective_v4", "omni_collective_v3", "v33_final", "omni_collective_v2", "v35_final", "v34_final", "qwen_v28", "v31_final", "v30_lite"):
             if key in self.record_map and self.record_map[key].supports_chat:
                 return self.record_map[key]
         for record in self.records:

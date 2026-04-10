@@ -43,6 +43,7 @@ try:
     from omni_collective_v6_model import OmniCollectiveEngineV6
     from omni_collective_v7_model import OmniCollectiveEngineV7
     from omni_collective_v8_model import OmniCollectiveEngineV8
+    from omni_collective_v42_model import OmniCollectiveEngineV42
     from omni_collective_v41_model import OmniCollectiveEngineV41
     from protein_folding_model import ProteinFoldingEngine
     from three_d_generation_model import ThreeDGenerationEngine
@@ -51,6 +52,7 @@ except ImportError:  # pragma: no cover
     from .omni_collective_v6_model import OmniCollectiveEngineV6
     from .omni_collective_v7_model import OmniCollectiveEngineV7
     from .omni_collective_v8_model import OmniCollectiveEngineV8
+    from .omni_collective_v42_model import OmniCollectiveEngineV42
     from .omni_collective_v41_model import OmniCollectiveEngineV41
     from .protein_folding_model import ProteinFoldingEngine
     from .three_d_generation_model import ThreeDGenerationEngine
@@ -457,6 +459,15 @@ class OmniCollectiveV8BenchmarkGenerator:
         return _normalize_response(self.engine.answer(user_text))
 
 
+class OmniCollectiveV42BenchmarkGenerator:
+    def __init__(self, *, weights_path: Path, meta_path: Path, device: str) -> None:
+        self.engine = OmniCollectiveEngineV42(weights_path=weights_path, meta_path=meta_path, device=torch.device(device))
+
+    def generate(self, user_text: str, max_new_tokens: int) -> str:
+        del max_new_tokens
+        return _normalize_response(self.engine.answer(user_text))
+
+
 class OmniCollectiveV41BenchmarkGenerator:
     def __init__(self, *, weights_path: Path, meta_path: Path, device: str) -> None:
         self.engine = OmniCollectiveEngineV41(weights_path=weights_path, meta_path=meta_path, device=torch.device(device))
@@ -641,6 +652,33 @@ def _append_local_v41_spec(models: List[ModelSpec], skipped: List[Dict[str, str]
     skipped.append({"name": "omni_collective_v41", "reason": f"missing local v41 weights/meta under {local_output_root}"})
 
 
+def _append_local_v42_spec(models: List[ModelSpec], skipped: List[Dict[str, str]], local_output_root: Path) -> None:
+    if not local_output_root.exists():
+        skipped.append({"name": "omni_collective_v42", "reason": f"local output root missing: {local_output_root}"})
+        return
+    candidates = sorted(
+        (path for path in local_output_root.glob("supermix_omni_collective_v42_*") if path.is_dir()),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for artifact_dir in candidates:
+        for stem in ("omni_collective_v42_frontier", "omni_collective_v42_smoke"):
+            weights_path = artifact_dir / f"{stem}.pth"
+            meta_path = artifact_dir / f"{stem}_meta.json"
+            if weights_path.exists() and meta_path.exists():
+                models.append(
+                    ModelSpec(
+                        name="omni_collective_v42",
+                        family="fusion",
+                        kind="omni_collective_v42",
+                        weights_path=weights_path,
+                        meta_path=meta_path,
+                    )
+                )
+                return
+    skipped.append({"name": "omni_collective_v42", "reason": f"missing local v42 weights/meta under {local_output_root}"})
+
+
 def _append_local_v8_preview_spec(models: List[ModelSpec], skipped: List[Dict[str, str]], local_output_root: Path) -> None:
     if not local_output_root.exists():
         skipped.append({"name": "omni_collective_v8_preview", "reason": f"local output root missing: {local_output_root}"})
@@ -810,6 +848,7 @@ def discover_models(persist_root: Path, include_qwen_base: bool, local_output_ro
         _append_local_v7_spec(models, skipped, local_output_root)
         _append_local_v8_spec(models, skipped, local_output_root)
         _append_local_v8_preview_spec(models, skipped, local_output_root)
+        _append_local_v42_spec(models, skipped, local_output_root)
         _append_local_v41_spec(models, skipped, local_output_root)
         _append_local_v40_spec(models, skipped, local_output_root)
         _append_local_protein_spec(models, skipped, local_output_root)
@@ -847,6 +886,10 @@ def _build_generator(spec: ModelSpec, *, device: str, qwen_base_model: Path):
         if spec.weights_path is None or spec.meta_path is None:
             raise ValueError(f"Incomplete omni_collective_v8 spec: {spec}")
         return OmniCollectiveV8BenchmarkGenerator(weights_path=spec.weights_path, meta_path=spec.meta_path, device=device)
+    if spec.kind == "omni_collective_v42":
+        if spec.weights_path is None or spec.meta_path is None:
+            raise ValueError(f"Incomplete omni_collective_v42 spec: {spec}")
+        return OmniCollectiveV42BenchmarkGenerator(weights_path=spec.weights_path, meta_path=spec.meta_path, device=device)
     if spec.kind == "omni_collective_v41":
         if spec.weights_path is None or spec.meta_path is None:
             raise ValueError(f"Incomplete omni_collective_v41 spec: {spec}")

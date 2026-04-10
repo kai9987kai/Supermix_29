@@ -1086,6 +1086,27 @@ def _all_model_distill_rows_v7(
         if teacher_model_limit > 0:
             teacher_records = teacher_records[: int(teacher_model_limit)]
 
+    if int(limit) <= 0 or not sample:
+        return [], {
+            "requested": int(limit),
+            "sampled": 0,
+            "accepted_total": 0,
+            "accepted_direct": {},
+            "accepted_repair": {},
+            "accepted_consensus": 0,
+            "empty_counts": {},
+            "discarded": 0,
+            "teacher_keys": [record.key for record in teacher_records],
+            "all_record_keys": [record.key for record in all_records],
+            "non_chat_record_keys": [record.key for record in all_records if not record.supports_chat],
+            "unavailable_teachers": {},
+            "timed_out_teachers": [],
+            "complete_teachers": [],
+            "partial_teachers": [],
+            "resume_dir": "",
+            "forced_priority_keys": ["v40_benchmax", "omni_collective_v7", "qwen_v28", "qwen_v30", "omni_collective_v6"],
+        }
+
     resume_dir = (
         Path(resume_dir_override).resolve()
         if resume_dir_override is not None

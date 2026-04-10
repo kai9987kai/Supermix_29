@@ -1,11 +1,12 @@
 ﻿{
-    "generated_at":  "2026-04-07T18:42:35.1458292+01:00",
+    "generated_at":  "2026-04-10T11:44:12.4177762+01:00",
     "models_dir":  "C:\\Users\\kai99\\Desktop\\models",
     "bundle_strategy":  "curated_core_plus_model_store",
-    "bundled_model_count":  10,
+    "bundled_model_count":  11,
     "bundled_model_keys":  [
                                "v40_benchmax",
-                               "omni_collective_v8_preview",
+                               "omni_collective_v41",
+                               "omni_collective_v8",
                                "omni_collective_v7",
                                "science_vision_micro_v1",
                                "v38_native_xlite_fp16",
@@ -23,10 +24,16 @@
                                "size_bytes":  81205267
                            },
                            {
-                               "key":  "omni_collective_v8_preview",
-                               "label":  "Omni Collective V8 Preview",
-                               "name":  "supermix_omni_collective_v8_preview_20260407_001155.zip",
-                               "size_bytes":  1647669376
+                               "key":  "omni_collective_v41",
+                               "label":  "Omni Collective V41 Frontier",
+                               "name":  "supermix_omni_collective_v41_frontier_20260410_015540.zip",
+                               "size_bytes":  505064875
+                           },
+                           {
+                               "key":  "omni_collective_v8",
+                               "label":  "Omni Collective V8 Frontier",
+                               "name":  "supermix_omni_collective_v8_frontier_20260408.zip",
+                               "size_bytes":  415181135
                            },
                            {
                                "key":  "omni_collective_v7",

@@ -285,6 +285,18 @@ ARTIFACT_SPECS: Sequence[ArtifactSpec] = (
         specialist_metric_label="omni val",
     ),
     ArtifactSpec(
+        key="omni_collective_v42",
+        label="omni_collective_v42",
+        family="fusion",
+        filename_tokens=("supermix_omni_collective_v42_frontier_", "supermix_omni_collective_v42_smoke_"),
+        common_row_key="omni_collective_v42",
+        score_source="specialist_only",
+        note="V42 continuation with benchmark-bridge replay, verifier-repair supervision, and budget-aware route control.",
+        specialist_summary_path="output/supermix_omni_collective_v42_smoke_20260410_173006/omni_collective_v42_smoke_summary.json",
+        specialist_metric_key="stage2.best_score",
+        specialist_metric_label="omni val",
+    ),
+    ArtifactSpec(
         key="omni_collective_v41",
         label="omni_collective_v41",
         family="fusion",

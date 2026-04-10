@@ -281,3 +281,7 @@ The current desktop app now supports:
 - this repo is intentionally not a clean source-only model repo
 - large local artifacts, checkpoints, and logs are often kept locally and mirrored selectively to releases or Hugging Face
 - the safest way to consume the desktop app is through the curated-core release plus the in-app model store
+
+
+<img width="3114" height="2847" alt="benchmark_all_models_common_plus_graph_20260410_runtime" src="https://github.com/user-attachments/assets/a3aed845-8ad7-438b-9a39-d44cee2d70b4" />
+
